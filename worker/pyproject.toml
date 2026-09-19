@@ -1,0 +1,17 @@
+[project]
+name = "asr-stress-gym-worker"
+version = "0.0.0"
+description = "ASR Stress Gym worker: adapter host over a fixed HTTP surface (open/push/flush/restore/close/health)."
+requires-python = ">=3.11"
+# M0: stdlib only (http.server), zero dependencies.
+# M1 adds: fastapi, uvicorn (open/push/flush/restore/close over JSON).
+# M5 adds one dependency per adapter as it lands: numpy, sherpa-onnx,
+# faster-whisper / ctranslate2, onnxruntime.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

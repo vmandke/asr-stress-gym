@@ -1,0 +1,166 @@
+# M0 scope only: every service here does health/identity and nothing else.
+#
+# Not yet wired (added at their own milestone, per docs/implementation-plan.md,
+# so nothing sits in this file half-configured and silently broken):
+#   - worker-e, the same-weights-different-runtime pair for worker-d -> M6 (--profile models)
+#   - bifrost                                                        -> M7
+#   - the ha profile (nginx + gateway-2)                             -> M9 (docker-compose.ha.yml)
+#
+# Resource limits are pinned from the start (docs/build-plan.md "Reproducible
+# capacity numbers") so later RTF/concurrency numbers are reproducible on any
+# machine, not just this one.
+
+x-worker-resources: &worker-resources
+  cpus: "1.5"
+  memory: 1536M
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/gateway.Dockerfile
+    ports:
+      # Host-side mapping only; the container listens on the canonical
+      # 7070/7000 from docs/build-plan.md either way. Overridable because
+      # macOS's AirPlay Receiver (ControlCenter) squats on host port 7000
+      # by default from Monterey onward — a reviewer on macOS may need
+      # GATEWAY_DASHBOARD_PORT=7001 (or disable AirPlay Receiver in System
+      # Settings > General > AirDrop & Handoff) rather than hit a silent
+      # bind failure. See README "Troubleshooting".
+      - "${GATEWAY_WS_PORT:-7070}:7070"
+      - "${GATEWAY_DASHBOARD_PORT:-7000}:7000"
+    environment:
+      DASHBOARD_ADDR: ":7000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
+    restart: "no"
+    # Healthchecks, not sleeps (docs/build-plan.md "Startup ordering").
+    # The gateway does not yet call workers at M0 — this wiring is here so
+    # `docker compose up` orders correctly from the first milestone onward,
+    # rather than being bolted on later. The router's health tracking (M3)
+    # is still what lets the gateway tolerate a worker missing at boot.
+    depends_on:
+      worker-mock: { condition: service_healthy }
+      worker-a: { condition: service_healthy }
+      worker-b: { condition: service_healthy }
+      worker-c: { condition: service_healthy }
+      worker-d: { condition: service_healthy }
+
+  worker-mock:
+    build:
+      context: worker
+      dockerfile: Dockerfile
+    environment:
+      WORKER_ID: "worker-mock"
+      MODEL: "mock-v1"
+      COMPAT_KEY_HASH: "sha256:K0-mock-v1"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: "no"
+
+  worker-a:
+    build:
+      context: worker
+      dockerfile: Dockerfile
+    environment:
+      WORKER_ID: "worker-a"
+      MODEL: "zipformer-en-20M"
+      COMPAT_KEY_HASH: "sha256:K1-zipformer-sherpa-int8"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits: *worker-resources
+    restart: "no"
+
+  worker-b:
+    build:
+      context: worker
+      dockerfile: Dockerfile
+    environment:
+      WORKER_ID: "worker-b"
+      MODEL: "zipformer-en-20M"
+      COMPAT_KEY_HASH: "sha256:K1-zipformer-sherpa-int8" # same key as worker-a -> same-model failover
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits: *worker-resources
+    restart: "no"
+
+  worker-c:
+    build:
+      context: worker
+      dockerfile: Dockerfile
+    environment:
+      WORKER_ID: "worker-c"
+      MODEL: "zipformer-ctc-en"
+      COMPAT_KEY_HASH: "sha256:K2-zipformer-ctc-sherpa-int8" # different family -> cross-model failover
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits: *worker-resources
+    restart: "no"
+
+  worker-d:
+    build:
+      context: worker
+      dockerfile: Dockerfile
+    environment:
+      WORKER_ID: "worker-d"
+      MODEL: "whisper-tiny.en"
+      COMPAT_KEY_HASH: "sha256:K3-whisper-ct2-int8" # non-streaming -> offline + finals only
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits: *worker-resources
+    restart: "no"
+
+  loadgen:
+    build:
+      context: .
+      dockerfile: deploy/loadgen.Dockerfile
+    # No healthcheck: idle by design until driven from the dashboard
+    # (POST /api/load/{n}, M9). Nothing depends on it being "healthy".
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    restart: "no"

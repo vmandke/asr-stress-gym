@@ -1,0 +1,26 @@
+# Go
+/bin/
+*.test
+*.out
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Model weights: fetched at image build time (models/fetch.sh), never committed.
+# Corpus clips ARE committed (see corpus/README.md) — do not add corpus/ here.
+models/download/
+models/.cache/
+
+# Benchmark/chaos output
+/results/
+*.csv
+!corpus/**/*.csv
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
