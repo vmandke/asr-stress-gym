@@ -25,6 +25,7 @@ import (
 
 	"asr-stress-gym/internal/audio"
 	"asr-stress-gym/internal/backend"
+	"asr-stress-gym/internal/journal"
 	"asr-stress-gym/internal/session"
 	"asr-stress-gym/internal/wire"
 )
@@ -35,6 +36,13 @@ const (
 
 	onlineChunkMs  = 160  // build-plan.md's online chunking constant
 	offlineChunkMs = 2000 // ...and offline
+
+	// ~30s retention at the nominal 20ms cadence (build-plan.md's own
+	// retention target). Frame SIZE is client-controlled (num_samples),
+	// not mode-dependent, so this is one constant regardless of
+	// online/offline — chunk size (onlineChunkMs/offlineChunkMs above) is
+	// a separate, unrelated knob on audio.Pipeline's own accumulator.
+	journalCapacity = 1500
 
 	writeTimeout = 2 * time.Second
 	closeTimeout = 2 * time.Second
@@ -189,6 +197,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 	state := session.NewInferenceState(sessID, "")
 	emitter := session.NewEmitter(state)
 	seqV := session.NewSeqValidator()
+	j := journal.New(journalCapacity)
 
 	var (
 		started  bool
@@ -225,7 +234,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 
 		switch f.Type {
 		case wire.MsgControl:
-			if !handleControl(ctx, cfg, f, state, emitter, events, &started, &pipeline, &client) {
+			if !handleControl(ctx, cfg, f, state, emitter, events, j, &started, &pipeline, &client) {
 				return
 			}
 		case wire.MsgAudio:
@@ -233,7 +242,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 				trySend(ctx, events, emitter.Error("audio frame received before session.start"))
 				return
 			}
-			if !handleAudioFrame(ctx, f, pipeline, client, state, emitter, events) {
+			if !handleAudioFrame(ctx, f, pipeline, client, state, emitter, events, j) {
 				return
 			}
 		}
@@ -245,7 +254,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 // clean session.end that has already emitted its final).
 func handleControl(
 	ctx context.Context, cfg connConfig, f wire.Frame,
-	state *session.InferenceState, emitter *session.Emitter, events chan<- any,
+	state *session.InferenceState, emitter *session.Emitter, events chan<- any, j *journal.Journal,
 	started *bool, pipeline *audio.Pipeline, client *backend.Client,
 ) bool {
 	msg, err := wire.DecodeControl(f.Payload)
@@ -302,7 +311,16 @@ func handleControl(
 			trySend(ctx, events, emitter.Error(fmt.Sprintf("backend flush failed: %v", err)))
 			return false
 		}
-		finalEv, _ := emitter.Final(flushResp.Text, 0, state.LastAppliedSeq)
+		finalEv, isNew := emitter.Final(flushResp.Text, 0, state.LastAppliedSeq)
+		if isNew {
+			// Trim on every committed final (build-plan.md). M1/M2: exactly
+			// one utterance per session, so the final's own seq_end is the
+			// correct floor directly — no min(committedSeq, openUtteranceStart)
+			// needed yet (implementation-plan.md defect #8's fuller formula
+			// applies once M4 allows a new utterance to already be open
+			// when this fires).
+			j.TrimBefore(finalEv.SeqEnd)
+		}
 		trySend(ctx, events, finalEv)
 		return false // clean end: stop the session loop, same as an error return
 
@@ -314,12 +332,21 @@ func handleControl(
 
 func handleAudioFrame(
 	ctx context.Context, f wire.Frame, pipeline audio.Pipeline, client backend.Client,
-	state *session.InferenceState, emitter *session.Emitter, events chan<- any,
+	state *session.InferenceState, emitter *session.Emitter, events chan<- any, j *journal.Journal,
 ) bool {
-	if _, err := pipeline.Ingest(f); err != nil {
+	ref, err := pipeline.Ingest(f)
+	if err != nil {
 		trySend(ctx, events, emitter.Error(fmt.Sprintf("audio ingest failed: %v", err)))
 		return false
 	}
+	// Every accepted frame is journaled, including silence (Voiced is
+	// always true at M1/M2 — VAD lands at M4) — the journal's
+	// completeness is what makes a full audio rebuild always possible
+	// regardless of what gets gated out of chunk dispatch. See
+	// internal/journal's package doc for why this, plus Recut, is the
+	// complete replay mechanism with no separate dispatch-log structure.
+	j.Append(audio.Record{Seq: f.Seq, DurationMs: ref.DurationMs, Voiced: ref.Voiced, Payload: f.Payload})
+
 	for _, c := range pipeline.Ready() {
 		if !dispatchChunk(ctx, c, client, state, emitter, events) {
 			return false

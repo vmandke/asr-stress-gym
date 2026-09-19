@@ -54,12 +54,19 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` pending
 
 ## M2 — journal, dispatch log, emission contract
 
-- [ ] Ring journal over opaque payloads (`Record`/`Span` split, defect #2/#3 fix)
-- [ ] Utterance lifecycle
-- [ ] Emission rules: immutability + finals-dedupe in one place (defect #10 fix); `ack` event (defect #7 fix)
-- [ ] Unit tests: journal (append, `ReadAfter`, `ReadFromCommitted`, trim w/ retention, wraparound)
-- [ ] Unit tests: emission contract (revision monotonic, final locks utterance, duplicate seq/final = no-op)
-- [ ] Boundary contract test: batched vs. single frames → same chunk count
+- [x] Ring journal over opaque payloads: `internal/journal` — fixed-capacity, wraparound-tested, `Append`/`ReadAfter`/`ReadFromCommitted`/`TrimBefore`
+- [x] Utterance lifecycle: `InferenceState.NewUtterance()` — resets the per-utterance emission counters, session-wide `seq`/`Generation` untouched
+- [x] Emission rules: immutability + finals-dedupe in one place, now correctly **per-utterance** rather than session-wide (a real latent bug found and fixed this milestone — see below); `ack` event was already wired at M1
+- [x] Journal wired into `cmd/gateway`'s hot path: every accepted audio frame appended (including silence, since `Voiced` is always true until M4's VAD lands); `TrimBefore` called with the final's own `seq_end` when it locks
+- [x] Unit tests: journal — append, `ReadAfter`, `ReadFromCommitted`, `TrimBefore` (incl. trimming beyond what's retained, and a floor set before wraparound physically evicts it anyway), wraparound (single wrap and repeated full cycles)
+- [x] Unit tests: emission contract — revision monotonic (M1), final locks the utterance (M1), duplicate seq/final = no-op (M1), **and now**: two sequential utterances are fully independent (revision resets, a new utterance's partials don't panic against the old one's final, dedupe follows the current utterance, not a stale one)
+- [x] Integration test tying M1+M2 together: journal-stored records fed through `audio.Pipeline.Recut` reproduce the exact chunk boundaries live dispatch produced (`TestJournalRecordsFeedRecutCorrectly`)
+- [x] Boundary contract test (batched vs. single frames → same chunk count): already built and passing at M1 (`TestChunkCountIndependentOfFraming`)
+- [x] Full regression + real end-to-end `make smoke` against the containerized stack, re-verified after wiring the journal into the hot path
+
+**Design refinement made while implementing:** the plan's wording suggested a separate "dispatch log" of `audio.Span` values alongside the record ring. Building M2 surfaced that this would be redundant — M1's `Recut` already proved (`TestRecutReproducesLiveDispatch`) that replaying raw `Record`s alone deterministically reproduces the original chunk boundaries, *provided* replay only starts where the live accumulator was empty. Both of this system's actual replay entry points (a checkpoint, taken right after a chunk commits; a committed final, reached right after `Flush()` empties the accumulator) satisfy that by construction. So `Journal` + `Recut` together already deliver what a separately persisted span log would have — see `internal/journal`'s package doc for the full reasoning. Nothing in M3's planned failover algorithms needs anything more than `ReadAfter`/`ReadFromCommitted` feeding `Recut`.
+
+**Bug found and fixed while implementing** (the same "verify end to end" discipline as M1 — this one caught by re-reading M1's own code before building on it, not by a test failing): `Emitter`'s `Finalized`/`lastFinal` were session-wide. Once *any* utterance finalized, every later utterance's `Partial()` would have panicked forever — harmless today (M1/M2 never has more than one utterance per session) but a real, silent trap for M4. Fixed by scoping both to the current utterance via `NewUtterance()`'s reset, proven by `TestUtterancesAreIndependentAfterNewUtterance`.
 
 ## M3 — failover, both modes (the thesis)
 
@@ -127,14 +134,14 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` pending
 |---|---|---|---|
 | 1 | Three conflicting backend interfaces | M1 (`backend.Client` + `Adapter`) | [x] `internal/backend.Client` (Go↔worker) and `worker/adapters/base.Adapter` (in-process) are the only two, verified compatible end-to-end via `make smoke` |
 | 2 | Sample-level DSP scattered outside one boundary | M1 (real chunking) / M4 (VAD) | [x] duration-based chunk cutting is real and tested (invariant 2 holds); VAD gating alone deferred to M4 |
-| 3 | Replay undefined over silence | M2 (dispatch log) | [ ] |
-| 4 | Chunk boundaries not preserved on replay | M2 (`Recut`) | [x] early: `audio.Pipeline.Recut` implemented and tested at M1 (byte-for-byte reproduction of live dispatch), ahead of its M2 caller |
+| 3 | Replay undefined over silence | M1 (`Recut` skips non-voiced) + M2 (journal retains everything) | [x] journal stores every record, voiced or not (`TestSilenceNeverEntersChunkContent` + journal's own completeness); no separate dispatch-log structure needed — see M2's design refinement below |
+| 4 | Chunk boundaries not preserved on replay | M1 (`Recut`) + M2 (journal integration proven) | [x] `TestJournalRecordsFeedRecutCorrectly` confirms journal-stored records feed `Recut` and reproduce live dispatch exactly |
 | 5 | `audio_b64` contradicts the doc's own base64 rejection | M1 (binary body) | [x] `Push` is a true binary body; verified against the real worker, not just the fake one |
 | 6 | Unbounded recursion in `handleBackendFailure` | M3 (bounded loop) | [ ] |
 | 7 | No `ack` event for client-side replay | M2 | [x] early: `ack` implemented and wired at M1 (piggybacks session_id delivery on session.start's ack too) |
-| 8 | `TrimBefore` can discard pre-roll | M2 | [ ] |
+| 8 | `TrimBefore` can discard pre-roll | M2 (current scope) / M4 (full formula) | [x] safe for M1/M2's actual shape — one utterance per session, trimmed once at its own final, no "still-open utterance" case can exist yet; the full `min(committedSeq, openUtteranceStart)` formula is only meaningful once M4 allows a new utterance to already be open when an earlier one's final commits |
 | 9 | "Continue without reset" needs unsafe text diffing | M3 (always reset) | [ ] |
-| 10 | No finals-dedupe structure specified | M2 (multi-utterance set) | [x] single-utterance case (M1's actual scope — no VAD yet, one utterance per session) fully handled by `Emitter.Final`'s idempotency guard; the multi-utterance dedupe set is still M2 |
+| 10 | No finals-dedupe structure specified | M2 | [x] `Emitter`'s dedupe is now correctly per-utterance (not session-wide — a real bug found and fixed this milestone, see below), proven by `TestUtterancesAreIndependentAfterNewUtterance` |
 | 11 | Non-streaming adapters have no capability signal | M5/M6 (`Capabilities`) | [x] early: `Capabilities` struct implemented and returned from `open` at M1, ahead of its M6 router caller |
 | 12 | Thesis scheduled as phase 5 of 7 | M3 (moved up) | [x] resequenced in the plan |
 

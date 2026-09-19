@@ -74,6 +74,57 @@ func TestUtteranceLabelFormat(t *testing.T) {
 	}
 }
 
+// A latent bug caught while building M2: Finalized/lastFinal being
+// session-wide (rather than scoped to the current utterance) would have
+// permanently blocked every later utterance's partials the moment ANY
+// utterance finalized. NewUtterance's reset is the fix; this proves each
+// utterance's lifecycle is independent, not just that the first one works.
+func TestUtterancesAreIndependentAfterNewUtterance(t *testing.T) {
+	st := NewInferenceState("s1", ModeOnline)
+	e := NewEmitter(st)
+
+	e.Partial("first utterance partial")
+	first, isNew := e.Final("first utterance final", 0, 10)
+	if !isNew || first.UtteranceID != "u1" {
+		t.Fatalf("got %+v isNew=%v, want u1's fresh final", first, isNew)
+	}
+
+	st.NewUtterance()
+	if st.UtteranceID != 2 || st.Finalized {
+		t.Fatalf("NewUtterance: UtteranceID=%d Finalized=%v, want 2/false", st.UtteranceID, st.Finalized)
+	}
+
+	// Without the fix, this would panic: mustNotBeFinalized would still
+	// see the OLD utterance's Finalized=true.
+	p := e.Partial("second utterance partial")
+	if p.UtteranceID != "u2" {
+		t.Fatalf("got utterance_id %q, want u2", p.UtteranceID)
+	}
+	if p.Revision != 1 {
+		t.Fatalf("revision = %d after NewUtterance, want 1 (reset, not accumulated from u1)", p.Revision)
+	}
+
+	second, isNew := e.Final("second utterance final", 11, 20)
+	if !isNew || second.UtteranceID != "u2" {
+		t.Fatalf("got %+v isNew=%v, want u2's fresh final", second, isNew)
+	}
+	if second == first {
+		t.Fatal("u2's final is identical to u1's — dedupe leaked across the utterance transition")
+	}
+
+	// A further Final() call now must dedupe against u2 (the CURRENT
+	// utterance), not resurrect or re-check against u1 — the text/seq
+	// arguments here are irrelevant and ignored precisely because this is
+	// the idempotent-replay path.
+	replay, isNew := e.Final("ignored: state.Finalized is already true", 0, 0)
+	if isNew {
+		t.Fatal("Final() after a NewUtterance transition reported isNew=true for what should be u2's already-finalized state")
+	}
+	if replay != second {
+		t.Fatalf("re-delivery returned %+v, want the CURRENT (u2) final %+v", replay, second)
+	}
+}
+
 // Invariant 11: the three counters never collapse into one. Sanity-checks
 // the struct shape; real epoch-bumping logic (on reconnect / failover)
 // lands at M1-reconnect and M3 respectively.
