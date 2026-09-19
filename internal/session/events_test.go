@@ -20,6 +20,38 @@ func TestPartialRevisionStrictlyIncreases(t *testing.T) {
 	}
 }
 
+// build-plan.md's own example: revision 17 [partial], 18 [partial.reset],
+// 19 [partial] — reset is part of the SAME strictly-increasing sequence,
+// not a restart of it.
+func TestPartialResetContinuesTheRevisionSequence(t *testing.T) {
+	st := NewInferenceState("s1", ModeOnline)
+	e := NewEmitter(st)
+
+	p1 := e.Partial("transfer five thousand to ram")
+	reset := e.PartialReset()
+	p2 := e.Partial("transfer five thousand to ramya")
+
+	if !(p1.Revision < reset.Revision && reset.Revision < p2.Revision) {
+		t.Fatalf("revisions not strictly increasing across reset: %d, %d, %d", p1.Revision, reset.Revision, p2.Revision)
+	}
+	if reset.Type != "partial.reset" || reset.UtteranceID != "u1" {
+		t.Fatalf("got %+v", reset)
+	}
+}
+
+func TestPartialResetAfterFinalPanics(t *testing.T) {
+	st := NewInferenceState("s1", ModeOnline)
+	e := NewEmitter(st)
+	e.Final("done", 0, 10)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic: partial.reset emitted after final")
+		}
+	}()
+	e.PartialReset()
+}
+
 // "duplicate final is a no-op, so delivery can be at-least-once."
 func TestFinalIsIdempotent(t *testing.T) {
 	st := NewInferenceState("s1", ModeOnline)

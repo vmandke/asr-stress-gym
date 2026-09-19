@@ -43,7 +43,7 @@ demo:
 	@echo "make demo: not implemented until M3/M9 (kill a worker, watch it recover)" >&2; exit 1
 
 chaos:
-	@echo "make chaos: not implemented until M3 (scenarios 2,3,5 first)" >&2; exit 1
+	./scripts/chaos.sh
 
 bench:
 	@echo "make bench: not implemented until M8 (benchmarks A-F)" >&2; exit 1

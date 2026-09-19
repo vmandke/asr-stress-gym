@@ -15,9 +15,14 @@ _REGISTRY: dict[str, type] = {
 }
 
 
-def build(name: str) -> Adapter:
+def build(name: str, *, model_id: str | None = None) -> Adapter:
+    """model_id is forwarded to every adapter's constructor — see
+    mock.MockAdapter for why. A real adapter (M5) is free to ignore it
+    (its identity comes from which weights it loaded), but should still
+    accept the kwarg for this call site to stay uniform across the
+    registry."""
     try:
         cls = _REGISTRY[name]
     except KeyError:
         raise ValueError(f"unknown ADAPTER {name!r}; available: {sorted(_REGISTRY)}") from None
-    return cls()
+    return cls(model_id=model_id)

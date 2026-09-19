@@ -21,6 +21,19 @@ type PartialEvent struct {
 	Text          string `json:"text"`
 }
 
+// PartialResetEvent tells the client to discard what's displayed — a
+// failover occurred. It carries its own Revision, part of the SAME
+// strictly-increasing sequence as PartialEvent (build-plan.md's example:
+// revision 17 [partial], 18 [partial.reset], 19 [partial] — reset doesn't
+// restart the count, it's simply the next emission in it).
+type PartialResetEvent struct {
+	Type          string `json:"type"` // "partial.reset"
+	SessionID     string `json:"session_id"`
+	UtteranceID   string `json:"utterance_id"`
+	Revision      uint64 `json:"revision"`
+	FailoverEpoch uint64 `json:"failover_epoch"`
+}
+
 type FinalEvent struct {
 	Type        string `json:"type"` // "final"
 	SessionID   string `json:"session_id"`
@@ -100,6 +113,27 @@ func (e *Emitter) Partial(text string) PartialEvent {
 		Revision:      e.state.PartialRevision,
 		FailoverEpoch: e.state.FailoverEpoch,
 		Text:          text,
+	}
+}
+
+// PartialReset tells the client to discard the displayed partial — a
+// failover just happened. Always emitted on ANY failover, same-model or
+// cross (implementation-plan.md defect #9: build-plan.md's suggestion
+// that same-model recovery "may continue without reset" would need a
+// safe cross-generation text diff to justify skipping this, which is a
+// correctness risk for a cosmetic saving — this implementation never
+// takes it). Bumps PartialRevision like Partial does, and is subject to
+// the same "not after final" guard.
+func (e *Emitter) PartialReset() PartialResetEvent {
+	e.mustNotBeFinalized("partial.reset")
+	e.state.PartialRevision++
+	e.state.LastPartial = ""
+	return PartialResetEvent{
+		Type:          "partial.reset",
+		SessionID:     e.state.SessionID,
+		UtteranceID:   e.state.UtteranceLabel(),
+		Revision:      e.state.PartialRevision,
+		FailoverEpoch: e.state.FailoverEpoch,
 	}
 }
 

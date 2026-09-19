@@ -28,6 +28,20 @@ class MockState:
 
 
 class MockAdapter:
+    """model_id lets one adapter simulate several distinct "models" for
+    the fleet's compatibility-key story (docs/implementation-plan.md,
+    "Model fleet and deployments") without writing separate classes for
+    each — M3 needs at least two mock deployments that share a key and
+    one that doesn't (worker-a/worker-b vs worker-c), and this is what
+    makes that possible from one adapter. Driven by the worker's existing
+    MODEL env var (server.py), not a new one: worker-a and worker-b are
+    already configured with the same MODEL value, worker-c a different
+    one, for the fleet identities compose already assigns.
+    """
+
+    def __init__(self, model_id: str | None = None) -> None:
+        self._model_id = model_id or "mock-v1"
+
     def capabilities(self) -> Capabilities:
         return Capabilities(
             streaming=True,
@@ -41,7 +55,7 @@ class MockAdapter:
     def compatibility_key(self) -> CompatKey:
         return CompatKey(
             model_family="mock",
-            model_id="mock-v1",
+            model_id=self._model_id,
             model_revision="v1",
             runtime="mock",
             runtime_version="1",

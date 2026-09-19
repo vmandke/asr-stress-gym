@@ -1,4 +1,10 @@
-# M0 scope only: every service here does health/identity and nothing else.
+# M3 adds: the router (gateway's WORKER_URLS), fault injection (each
+# worker's supervisor admin port, 9001, mapped to a distinct host port so
+# chaos scripts can reach it directly), and drops the now-unused
+# COMPAT_KEY_HASH env var — the mock adapter derives its compatibility
+# key from MODEL instead (worker/adapters/mock.py), so worker-a/worker-b
+# sharing a MODEL value is what makes them same-model, not a separately
+# hand-maintained hash that could drift from it.
 #
 # Not yet wired (added at their own milestone, per docs/implementation-plan.md,
 # so nothing sits in this file half-configured and silently broken):
@@ -31,6 +37,16 @@ services:
       - "${GATEWAY_DASHBOARD_PORT:-7000}:7000"
     environment:
       DASHBOARD_ADDR: ":7000"
+      # id=url pairs, comma-separated (cmd/gateway/main.go's
+      # parseWorkerURLs) — internal compose DNS names, port 9000 (the
+      # worker's own port; 9001 is the supervisor's admin-only port, a
+      # separate concern the router never talks to).
+      WORKER_URLS: >-
+        worker-mock=http://worker-mock:9000,
+        worker-a=http://worker-a:9000,
+        worker-b=http://worker-b:9000,
+        worker-c=http://worker-c:9000,
+        worker-d=http://worker-d:9000
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:7000/health"]
       interval: 2s
@@ -44,10 +60,9 @@ services:
           memory: 1024M
     restart: "no"
     # Healthchecks, not sleeps (docs/build-plan.md "Startup ordering").
-    # The gateway does not yet call workers at M0 — this wiring is here so
-    # `docker compose up` orders correctly from the first milestone onward,
-    # rather than being bolted on later. The router's health tracking (M3)
-    # is still what lets the gateway tolerate a worker missing at boot.
+    # buildRouter tolerates a worker being absent at boot (retries, then
+    # excludes it) — depends_on is about a clean FIRST run, not a
+    # correctness requirement the gateway relies on.
     depends_on:
       worker-mock: { condition: service_healthy }
       worker-a: { condition: service_healthy }
@@ -62,7 +77,9 @@ services:
     environment:
       WORKER_ID: "worker-mock"
       MODEL: "mock-v1"
-      COMPAT_KEY_HASH: "sha256:K0-mock-v1"
+    ports:
+      - "${WORKER_MOCK_ADMIN_PORT:-19000}:9001" # supervisor: POST /admin/die|restore — see docs/PROTOCOL.md "Fault injection"
+      - "${WORKER_MOCK_PORT:-18000}:9000" # the worker's own port: /health (active_sessions) observable from the host, e.g. by chaos scripts detecting which worker a session pinned to
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
       interval: 2s
@@ -82,8 +99,10 @@ services:
       dockerfile: Dockerfile
     environment:
       WORKER_ID: "worker-a"
-      MODEL: "zipformer-en-20M"
-      COMPAT_KEY_HASH: "sha256:K1-zipformer-sherpa-int8"
+      MODEL: "zipformer-en-20M" # same MODEL as worker-b -> same compatibility key -> same-model failover (chaos scenario 2)
+    ports:
+      - "${WORKER_A_ADMIN_PORT:-19001}:9001"
+      - "${WORKER_A_PORT:-18001}:9000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
       interval: 2s
@@ -101,8 +120,10 @@ services:
       dockerfile: Dockerfile
     environment:
       WORKER_ID: "worker-b"
-      MODEL: "zipformer-en-20M"
-      COMPAT_KEY_HASH: "sha256:K1-zipformer-sherpa-int8" # same key as worker-a -> same-model failover
+      MODEL: "zipformer-en-20M" # same as worker-a, on purpose — see above
+    ports:
+      - "${WORKER_B_ADMIN_PORT:-19002}:9001"
+      - "${WORKER_B_PORT:-18002}:9000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
       interval: 2s
@@ -120,8 +141,10 @@ services:
       dockerfile: Dockerfile
     environment:
       WORKER_ID: "worker-c"
-      MODEL: "zipformer-ctc-en"
-      COMPAT_KEY_HASH: "sha256:K2-zipformer-ctc-sherpa-int8" # different family -> cross-model failover
+      MODEL: "zipformer-ctc-en" # different family from a/b -> different key -> cross-model failover (chaos scenario 3)
+    ports:
+      - "${WORKER_C_ADMIN_PORT:-19003}:9001"
+      - "${WORKER_C_PORT:-18003}:9000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
       interval: 2s
@@ -139,8 +162,10 @@ services:
       dockerfile: Dockerfile
     environment:
       WORKER_ID: "worker-d"
-      MODEL: "whisper-tiny.en"
-      COMPAT_KEY_HASH: "sha256:K3-whisper-ct2-int8" # non-streaming -> offline + finals only
+      MODEL: "whisper-tiny.en" # non-streaming role reserved for M6 -> offline + finals only
+    ports:
+      - "${WORKER_D_ADMIN_PORT:-19004}:9001"
+      - "${WORKER_D_PORT:-18004}:9000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
       interval: 2s

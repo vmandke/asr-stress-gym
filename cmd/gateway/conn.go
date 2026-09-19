@@ -1,14 +1,14 @@
 // Per-connection orchestration: readLoop / sessionLoop / writeLoop
 // (build-plan.md "Goroutine structure"), wiring internal/wire,
-// internal/session, internal/audio and internal/backend together.
+// internal/session, internal/audio, internal/journal, internal/router,
+// internal/coord and internal/backend together.
 //
-// This lives in cmd/gateway, not internal/coord, deliberately: M1 has no
-// router and no pool (build-plan.md Phase 1's own scope), so a session
-// opens against one statically configured worker with no selection logic.
-// internal/coord's package doc already earmarks the formal Session
-// Coordinator — with failover, pinning, and a real router behind it — for
-// M3. This file is what that coordinator will absorb and extend, not a
-// permanent home for it.
+// M3 note: this file absorbed internal/coord's failover calls directly
+// rather than growing a separate "Coordinator" type that duplicates the
+// state sessionLoop already owns — coord exports the recovery algorithms
+// as functions over an explicit RecoveryDeps bundle precisely so this
+// file (the actual owner of a connection's state) can call them, not so
+// a second stateful object needs to shadow sessionLoop's own state.
 package main
 
 import (
@@ -25,7 +25,10 @@ import (
 
 	"asr-stress-gym/internal/audio"
 	"asr-stress-gym/internal/backend"
+	"asr-stress-gym/internal/coord"
 	"asr-stress-gym/internal/journal"
+	"asr-stress-gym/internal/metrics"
+	"asr-stress-gym/internal/router"
 	"asr-stress-gym/internal/session"
 	"asr-stress-gym/internal/wire"
 )
@@ -44,15 +47,19 @@ const (
 	// a separate, unrelated knob on audio.Pipeline's own accumulator.
 	journalCapacity = 1500
 
-	writeTimeout = 2 * time.Second
-	closeTimeout = 2 * time.Second
+	writeTimeout      = 2 * time.Second
+	closeTimeout      = 2 * time.Second
+	checkpointTimeout = 2 * time.Second
 )
 
-// connConfig is what a connection needs to reach a backend. At M1 there
-// is no router: every session opens against one statically configured
-// worker (build-plan.md Phase 1: "No ... pool").
+// connConfig is what every connection shares: one Router and one
+// CheckpointStore, both process-lifetime, constructed once in
+// cmd/gateway/main.go — see build-plan.md "Hop 3": the router is a
+// library inside the gateway process, not a service, and every
+// connection's sessionLoop calls Pick/Report on the SAME instance.
 type connConfig struct {
-	workerBaseURL string
+	Router      *router.Router
+	Checkpoints *coord.CheckpointStore
 }
 
 func newSessionID() string {
@@ -197,21 +204,40 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 	state := session.NewInferenceState(sessID, "")
 	emitter := session.NewEmitter(state)
 	seqV := session.NewSeqValidator()
-	j := journal.New(journalCapacity)
+
+	// deps bundles everything both the initial Open and every recovery
+	// call need. State/Emitter/Journal/Router/Checkpoints are set once,
+	// here, and never reassigned (their pointed-to content mutates
+	// normally through the pointers). Pipeline starts nil and is set
+	// exactly once, in handleControl's session.start case — deps must be
+	// passed as *coord.RecoveryDeps wherever that assignment needs to be
+	// visible afterward (handleControl only), and by value everywhere
+	// that only reads it (handleAudioFrame, dispatchChunk) since Go
+	// copies the struct but not what its pointer fields point to.
+	deps := coord.RecoveryDeps{
+		State:       state,
+		Emitter:     emitter,
+		Journal:     journal.New(journalCapacity),
+		Router:      cfg.Router,
+		Checkpoints: cfg.Checkpoints,
+	}
 
 	var (
-		started  bool
-		pipeline audio.Pipeline
-		client   backend.Client
+		started bool
+		client  backend.Client
 	)
 	defer func() {
 		if started {
 			cctx, ccancel := context.WithTimeout(context.Background(), closeTimeout)
-			defer ccancel()
 			if err := client.Close(cctx, state.Handle); err != nil {
 				log.Printf("gateway[%s]: backend close: %v", sessID, err)
 			}
+			ccancel()
+			if w, ok := cfg.Router.Find(state.WorkerID); ok {
+				w.UnbindSession()
+			}
 		}
+		cfg.Checkpoints.Delete(sessID) // avoid unbounded growth across the gateway process's lifetime
 	}()
 
 	for msg := range frames {
@@ -234,7 +260,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 
 		switch f.Type {
 		case wire.MsgControl:
-			if !handleControl(ctx, cfg, f, state, emitter, events, j, &started, &pipeline, &client) {
+			if !handleControl(ctx, cfg, f, &deps, events, &started, &client) {
 				return
 			}
 		case wire.MsgAudio:
@@ -242,7 +268,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 				trySend(ctx, events, emitter.Error("audio frame received before session.start"))
 				return
 			}
-			if !handleAudioFrame(ctx, f, pipeline, client, state, emitter, events, j) {
+			if !handleAudioFrame(ctx, f, deps, &client, events) {
 				return
 			}
 		}
@@ -254,9 +280,10 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 // clean session.end that has already emitted its final).
 func handleControl(
 	ctx context.Context, cfg connConfig, f wire.Frame,
-	state *session.InferenceState, emitter *session.Emitter, events chan<- any, j *journal.Journal,
-	started *bool, pipeline *audio.Pipeline, client *backend.Client,
+	deps *coord.RecoveryDeps, events chan<- any,
+	started *bool, client *backend.Client,
 ) bool {
+	state, emitter := deps.State, deps.Emitter
 	msg, err := wire.DecodeControl(f.Payload)
 	if err != nil {
 		trySend(ctx, events, emitter.Error(err.Error()))
@@ -276,17 +303,22 @@ func handleControl(
 
 		mode := session.Mode(m.Mode)
 		state.Mode = mode
-		*pipeline = audio.NewPassthroughPipeline(uint32(m.SampleRateHz), chunkMsFor(mode))
-		*client = backend.NewHTTPClient(cfg.workerBaseURL)
+		state.SampleRateHz = m.SampleRateHz // needed again if a failover ever has to re-Open against a replacement
+		deps.Pipeline = audio.NewPassthroughPipeline(uint32(m.SampleRateHz), chunkMsFor(mode))
 
-		resp, err := (*client).Open(ctx, backend.OpenReq{SessionID: state.SessionID, SampleRateHz: m.SampleRateHz, Mode: m.Mode})
+		target, resp, err := openWithRetry(ctx, cfg.Router, state.SessionID, mode, m)
 		if err != nil {
-			trySend(ctx, events, emitter.Error(fmt.Sprintf("backend open failed: %v", err)))
+			trySend(ctx, events, emitter.Error(fmt.Sprintf("no worker available: %v", err)))
 			return false
 		}
+		target.BindSession()
+		cfg.Router.Report(target.ID, true, 0)
+
+		state.WorkerID = target.ID
 		state.Handle = resp.Handle
-		state.CompatibilityKey = session.CacheCompatibilityKey(resp.CompatibilityKeyHash)
+		state.CompatibilityKey = target.CompatibilityKey
 		state.Generation = resp.Generation
+		*client = target.Client
 		*started = true
 
 		// Piggyback session_id delivery on the existing ack contract
@@ -301,11 +333,17 @@ func handleControl(
 			trySend(ctx, events, emitter.Error("session.end received before session.start"))
 			return false
 		}
-		for _, c := range (*pipeline).Flush() { // dispatch whatever tail never crossed a chunk threshold
-			if !dispatchChunk(ctx, c, *client, state, emitter, events) {
+		for _, c := range deps.Pipeline.Flush() { // dispatch whatever tail never crossed a chunk threshold
+			if !dispatchChunk(ctx, c, *deps, client, events) {
 				return false
 			}
 		}
+		// Not failover-protected: if the backend dies in exactly this
+		// window (after the tail replay above, before this call lands),
+		// the session errors out rather than attempting a second
+		// recovery here. A deliberate, documented scope limit for M3,
+		// not an oversight — the window is narrow and the failure mode
+		// is a clean error, not a hang or silent corruption.
 		flushResp, err := (*client).Flush(ctx, state.Handle)
 		if err != nil {
 			trySend(ctx, events, emitter.Error(fmt.Sprintf("backend flush failed: %v", err)))
@@ -319,7 +357,9 @@ func handleControl(
 			// needed yet (implementation-plan.md defect #8's fuller formula
 			// applies once M4 allows a new utterance to already be open
 			// when this fires).
-			j.TrimBefore(finalEv.SeqEnd)
+			deps.Journal.TrimBefore(finalEv.SeqEnd)
+		} else {
+			metrics.DuplicateFinalsTotal.Add(1) // must stay zero — asserted by every chaos scenario
 		}
 		trySend(ctx, events, finalEv)
 		return false // clean end: stop the session loop, same as an error return
@@ -330,13 +370,35 @@ func handleControl(
 	}
 }
 
-func handleAudioFrame(
-	ctx context.Context, f wire.Frame, pipeline audio.Pipeline, client backend.Client,
-	state *session.InferenceState, emitter *session.Emitter, events chan<- any, j *journal.Journal,
-) bool {
-	ref, err := pipeline.Ingest(f)
+// openWithRetry picks and opens against a worker, retrying against a
+// DIFFERENT candidate (excluding every one already tried) up to
+// coord.MaxFailoverAttempts times if Open itself fails — e.g. the picked
+// worker died in the window between Pick and Open. Simpler than
+// coord.HandleBackendFailure on purpose: there is no prior session state
+// to preserve or replay yet, since no audio has been sent.
+func openWithRetry(ctx context.Context, r *router.Router, sessionID string, mode session.Mode, m *wire.SessionStart) (*router.Worker, backend.OpenResp, error) {
+	excluded := map[string]bool{}
+	var lastErr error
+	for attempt := 0; attempt < coord.MaxFailoverAttempts; attempt++ {
+		target, err := r.Pick(mode, excluded, "")
+		if err != nil {
+			return nil, backend.OpenResp{}, err // no capacity at all; no point retrying
+		}
+		resp, err := target.Client.Open(ctx, backend.OpenReq{SessionID: sessionID, SampleRateHz: m.SampleRateHz, Mode: m.Mode})
+		if err == nil {
+			return target, resp, nil
+		}
+		lastErr = err
+		excluded[target.ID] = true
+		r.Report(target.ID, false, 0)
+	}
+	return nil, backend.OpenResp{}, fmt.Errorf("exhausted after %d attempts: %w", coord.MaxFailoverAttempts, lastErr)
+}
+
+func handleAudioFrame(ctx context.Context, f wire.Frame, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
+	ref, err := deps.Pipeline.Ingest(f)
 	if err != nil {
-		trySend(ctx, events, emitter.Error(fmt.Sprintf("audio ingest failed: %v", err)))
+		trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("audio ingest failed: %v", err)))
 		return false
 	}
 	// Every accepted frame is journaled, including silence (Voiced is
@@ -345,44 +407,99 @@ func handleAudioFrame(
 	// regardless of what gets gated out of chunk dispatch. See
 	// internal/journal's package doc for why this, plus Recut, is the
 	// complete replay mechanism with no separate dispatch-log structure.
-	j.Append(audio.Record{Seq: f.Seq, DurationMs: ref.DurationMs, Voiced: ref.Voiced, Payload: f.Payload})
+	deps.Journal.Append(audio.Record{Seq: f.Seq, DurationMs: ref.DurationMs, Voiced: ref.Voiced, Payload: f.Payload})
 
-	for _, c := range pipeline.Ready() {
-		if !dispatchChunk(ctx, c, client, state, emitter, events) {
+	for _, c := range deps.Pipeline.Ready() {
+		if !dispatchChunk(ctx, c, deps, client, events) {
 			return false
 		}
 	}
 	return true
 }
 
-// dispatchChunk pushes one chunk to the backend and emits partial+ack from
-// the response. Returns false if the session must terminate.
-func dispatchChunk(ctx context.Context, c audio.Chunk, client backend.Client, state *session.InferenceState, emitter *session.Emitter, events chan<- any) bool {
-	resp, err := client.Push(ctx, backend.PushReq{
-		Handle:             state.Handle,
+// dispatchChunk pushes one chunk to the backend, transparently recovering
+// via coord.HandleBackendFailure on a backend failure. A stale-generation
+// error is NOT a failover trigger — invariant 3 (one active owner at a
+// time) means that should never legitimately happen while this is the
+// only writer, so it surfaces as a session error instead of masking a
+// coordination bug as a transient backend problem.
+//
+// On a successful recovery, the chunk that triggered the failure is NOT
+// re-pushed here: its underlying frames were already journaled before
+// this Push was ever attempted (handleAudioFrame appends before
+// dispatching), so the recovery's own replay — which reads the journal
+// from the checkpoint or last committed boundary — already covers it.
+func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
+	pushStarted := time.Now()
+	resp, err := (*client).Push(ctx, backend.PushReq{
+		Handle:             deps.State.Handle,
 		SeqStart:           c.SeqStart,
 		SeqEnd:             c.SeqEnd,
-		ExpectedGeneration: state.Generation,
+		ExpectedGeneration: deps.State.Generation,
 		Audio:              c.Bytes,
 	})
 	if err != nil {
-		reason := err.Error()
 		if errors.Is(err, backend.ErrStaleGeneration) {
-			// One live session has exactly one active owner (invariant
-			// 3) and M1 has no failover yet, so this should never
-			// legitimately happen — surfacing it as a session error
-			// rather than silently retrying is the honest response to a
-			// bug, not a transient condition to paper over.
-			reason = "unexpected stale generation: " + reason
+			metrics.StaleGenerationWritesTotal.Add(1)
+			trySend(ctx, events, deps.Emitter.Error("unexpected stale generation: "+err.Error()))
+			return false
 		}
-		trySend(ctx, events, emitter.Error(reason))
-		return false
-	}
-	state.Generation = resp.Generation
-	state.LastAppliedSeq = resp.LastSeqApplied
 
-	if !trySend(ctx, events, emitter.Partial(resp.Text)) {
+		newClient, resetEv, regenerated, ferr := coord.HandleBackendFailure(ctx, deps, err)
+		if ferr != nil {
+			trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("failover exhausted: %v", ferr)))
+			return false
+		}
+		*client = newClient
+		if !trySend(ctx, events, resetEv) {
+			return false
+		}
+		if regenerated == nil {
+			return true // the replay had nothing to regenerate — see replayChunks
+		}
+		return trySend(ctx, events, deps.Emitter.Partial(*regenerated))
+	}
+	// Successful calls are the router's source of real latency samples.
+	// Without this report the router's gray-failure policy only exists in
+	// unit tests: no live worker ever accumulates a p95 to compare against
+	// the fleet. Failure reporting remains in HandleBackendFailure so the
+	// triggering error is counted exactly once before a replacement is Picked.
+	deps.Router.Report(deps.State.WorkerID, true, time.Since(pushStarted))
+
+	deps.State.Generation = resp.Generation
+	deps.State.LastAppliedSeq = resp.LastSeqApplied
+
+	// Async, best-effort, never on the critical path (invariant 13:
+	// checkpoint failure must never take down healthy inference) — this
+	// is what makes RecoverSameModel's cheap tail-replay path reachable
+	// at all; without it, Checkpoints.Latest would always miss and every
+	// same-key failover would silently degrade to the full-replay path.
+	// Values are snapshotted HERE, on sessionLoop's own goroutine (the
+	// sole writer to deps.State), and passed BY VALUE into the goroutine
+	// rather than letting it read deps.State fields itself — reading
+	// those concurrently with a later write (e.g. a subsequent failover
+	// mutating Handle) would be a real data race.
+	go asyncCheckpoint(deps.Checkpoints, *client, deps.State.SessionID, deps.State.CompatibilityKey, deps.State.Handle)
+
+	if !trySend(ctx, events, deps.Emitter.Partial(resp.Text)) {
 		return false
 	}
-	return trySend(ctx, events, emitter.Ack(resp.LastSeqApplied))
+	return trySend(ctx, events, deps.Emitter.Ack(resp.LastSeqApplied))
+}
+
+func asyncCheckpoint(checkpoints *coord.CheckpointStore, client backend.Client, sessionID string, key session.CacheCompatibilityKey, handle string) {
+	ctx, cancel := context.WithTimeout(context.Background(), checkpointTimeout)
+	defer cancel()
+	resp, err := client.Checkpoint(ctx, handle)
+	if err != nil {
+		if !errors.Is(err, backend.ErrNotSupported) {
+			// ErrNotSupported (Capabilities.Serializable == false) is an
+			// expected, permanent fact about this adapter, not worth a
+			// log line on every single push — every other error might be
+			// worth noticing, even though it's still non-fatal here.
+			log.Printf("gateway[%s]: async checkpoint failed (non-fatal, invariant 13): %v", sessionID, err)
+		}
+		return
+	}
+	checkpoints.Store(sessionID, key, resp)
 }

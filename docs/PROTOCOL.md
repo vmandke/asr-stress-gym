@@ -86,7 +86,7 @@ binary format. Readability wins where the rate argument doesn't apply.
 | `ack` | Cumulative: `highest_contiguous_seq` the gateway has durably accepted. Lets a reconnecting client know what it can drop from its own retry ring ([implementation-plan.md](implementation-plan.md) defect #7). Emitted once per dispatched chunk. | **M1** |
 | `speech.start` | VAD detected speech; a new utterance opened. | M4 (VAD) |
 | `partial` | Provisional; **replaces** the previous partial entirely. | **M1** (mock adapter text) |
-| `partial.reset` | Discard what is displayed; a failover occurred. | M3 (failover) |
+| `partial.reset` | Discard what is displayed; a failover occurred. **Always** emitted on failover, same-model or cross — see below. | **M3** |
 | `final` | Immutable; exactly one per utterance; carries its audio range. | **M1** (on `session.end`) |
 | `discontinuity` | Audio was lost between these sequence numbers. | **M1** |
 | `overloaded` | Admission refused; retryable. | M7 (backpressure) |
@@ -97,6 +97,9 @@ binary format. Readability wins where the rate argument doesn't apply.
 
 { "type": "partial", "session_id": "s1", "utterance_id": "u1",
   "revision": 3, "failover_epoch": 0, "text": "..." }
+
+{ "type": "partial.reset", "session_id": "s1", "utterance_id": "u1",
+  "revision": 4, "failover_epoch": 1 }
 
 { "type": "discontinuity", "session_id": "s1",
   "seq_start": 42, "seq_end": 51 }
@@ -114,6 +117,34 @@ Guarantees (see `internal/session` for enforcement, one place only):
 - Re-delivering an identical `final` is a no-op — delivery is at-least-once.
 - `failover_epoch` is always `0` until M3; present now so the wire shape
   never changes when failover lands.
+- **Corrected from build-plan.md's original text**: that doc suggested
+  same-model failover "may continue without reset". It doesn't — this
+  implementation always emits `partial.reset` on any failover, same-model
+  or cross. Reconstructing a safe cross-generation text diff to justify
+  *not* resetting is a correctness risk for a cosmetic saving; the
+  measurable difference between the two modes is recovery time and how
+  much audio gets recomputed, not whether the client sees a reset
+  ([implementation-plan.md](implementation-plan.md) defect #9).
+
+## Fault injection (chaos scripts, M3+)
+
+Two separate mechanisms, because they need different lifetimes:
+
+- **Process-level** (`die`/`restore`): a worker's Docker `CMD` runs
+  `supervisor.py`, a tiny parent that spawns `server.py` as a child.
+  `POST /admin/die` (on the supervisor's own port, 9001 — separate from
+  the worker's real traffic on 9000, since a killed child can't answer
+  anything on its own port) `SIGKILL`s the child; `POST /admin/restore`
+  respawns it. Nothing but the supervisor survives `die`, which is the
+  point.
+- **Request-level** (`slow`/`blackhole`/`429`/`corrupt`): module state on
+  the worker itself (port 9000, alongside the real API), toggled by
+  `POST /admin/slow {"ms"}`, `POST /admin/blackhole {"on"}`,
+  `POST /admin/429 {"rate"}`, `POST /admin/corrupt {"on"}` (corrupts
+  bytes returned from `/v1/stream/checkpoint`), and cleared by
+  `POST /admin/reset`. These don't need a second process: the worker
+  answering slowly, or wrong, is a property of one request, not of
+  whether the process exists.
 
 ## Gateway → Backend (HTTP)
 
@@ -138,8 +169,14 @@ POST /v1/stream/flush
   -> 200 {"text", "final": true}
 
 POST /v1/stream/restore        # same-model failover only
-  body: {"checkpoint_blob"}    # base64 OK here: infrequent, never the hot path
+  body: {"checkpoint_blob", "last_seq_applied"}  # base64 blob: infrequent, never the hot path
   -> 200 {"handle", "generation", "last_seq_applied"}
+  -> 501 {"error": "not_supported"}              <- capabilities.serializable == false
+  -> 422 {"error": "invalid_checkpoint"}         <- blob failed to deserialize (corrupt/malformed)
+
+POST /v1/stream/checkpoint     # asynchronous, never the hot path — see below
+  body: {"handle"}
+  -> 200 {"checkpoint_blob", "generation", "last_seq_applied"}
   -> 501 {"error": "not_supported"}              <- capabilities.serializable == false
 
 POST /v1/stream/close
@@ -147,11 +184,14 @@ POST /v1/stream/close
   -> 200 {}
 
 GET /health
-  -> WorkerAdvert (docs/build-plan.md "Worker advertisement")
+  -> WorkerAdvert (docs/build-plan.md "Worker advertisement"), extended
+     with "capabilities" (M3) — the router must filter and score a
+     candidate from ONE startup Health() call, before it ever Opens a
+     session against it, so everything Pick needs has to be here too.
 ```
 
-`capabilities` (returned from `open`) is the fleet's addition to the
-original contract — see [implementation-plan.md](implementation-plan.md),
+`capabilities` (returned from `open` and `health`) is the fleet's addition
+to the original contract — see [implementation-plan.md](implementation-plan.md),
 "Capability-aware routing": `streaming`, `serializable`, `endpointing`,
 `modes`, `min_chunk_ms`, `max_chunk_ms`. A router (M3+) filters on these
 before it ever scores a candidate.
@@ -164,6 +204,14 @@ Two fields carry the correctness weight, both **wired at M1**:
   mismatch means the caller's view of state is stale, and the write is
   rejected rather than silently corrupting the session.
 
-`open`/`push`/`flush`/`close` are wired at M1 against the mock adapter.
-`restore` exists in the interface at M1 (so the contract is complete and
-stable) but has no real caller until M3.
+**`checkpoint` and `restore` are asymmetric, on purpose.** `checkpoint`
+asks the CURRENTLY-PINNED worker to serialize its own state; the caller
+(the gateway) holds onto the resulting blob itself — checkpoints live
+gateway-side, alongside the audio journal, for the same reason the journal
+does: both have to survive the death of the worker they're about.
+`restore` is the inverse, sent to a DIFFERENT (replacement) worker. A
+worker never restores into itself.
+
+`open`/`push`/`flush`/`close`/`restore` are wired at M1-M3 against the
+mock adapter; `checkpoint` is wired at M3. All six are exercised by the
+fleet's mock deployments before any real model (M5) touches this surface.

@@ -78,6 +78,13 @@ type FlushResp struct {
 
 type RestoreReq struct {
 	CheckpointBlob []byte
+	// LastSeqApplied is read back from the CheckpointResp that produced
+	// CheckpointBlob (see Checkpoint) and threaded through so the fresh
+	// handle this creates correctly reflects how much audio the restored
+	// state already accounts for — without it, tail replay would start
+	// from 0 and redundantly (if harmlessly, thanks to idempotent
+	// replay) resend audio the checkpoint already covers.
+	LastSeqApplied uint64
 }
 
 type RestoreResp struct {
@@ -87,17 +94,35 @@ type RestoreResp struct {
 }
 
 // WorkerAdvert matches build-plan.md's "Worker advertisement" JSON,
-// already served at M0's GET /health.
+// already served at M0's GET /health — plus Capabilities (M3), an
+// additive extension: the router (internal/router) must filter and score
+// candidates from a single startup Health() call, before it ever Opens a
+// session against one, so everything Pick needs to decide has to be here.
 type WorkerAdvert struct {
-	WorkerID             string   `json:"worker_id"`
-	Status               string   `json:"status"`
-	Model                string   `json:"model"`
-	CompatibilityKeyHash string   `json:"compatibility_key_hash"`
-	ActiveSessions       int      `json:"active_sessions"`
-	StateBytes           int64    `json:"state_bytes"`
-	QueueDepth           int      `json:"queue_depth"`
-	RTFP50               *float64 `json:"rtf_p50"`
-	LastHeartbeatMs      int64    `json:"last_heartbeat_ms"`
+	WorkerID             string       `json:"worker_id"`
+	Status               string       `json:"status"`
+	Model                string       `json:"model"`
+	CompatibilityKeyHash string       `json:"compatibility_key_hash"`
+	Capabilities         Capabilities `json:"capabilities"`
+	ActiveSessions       int          `json:"active_sessions"`
+	StateBytes           int64        `json:"state_bytes"`
+	QueueDepth           int          `json:"queue_depth"`
+	RTFP50               *float64     `json:"rtf_p50"`
+	LastHeartbeatMs      int64        `json:"last_heartbeat_ms"`
+}
+
+// CheckpointResp is the worker's answer to "give me your current state to
+// checkpoint". Note the asymmetry with Restore: the CALLER here is the
+// gateway asking the CURRENTLY-PINNED worker for a blob it will hold onto
+// itself — checkpoints live gateway-side (internal/coord), the same place
+// the audio journal does, and for the same reason (docs/build-plan.md's
+// topology section: a worker's state is rebuildable from the journal, but
+// the journal — and now the checkpoint — has to survive that worker's
+// death, so neither can live only in that worker's own memory).
+type CheckpointResp struct {
+	CheckpointBlob []byte
+	Generation     uint64
+	LastSeqApplied uint64
 }
 
 // Client is the coordinator's entire view of a backend. There is no
@@ -109,6 +134,7 @@ type Client interface {
 	Push(ctx context.Context, r PushReq) (PushResp, error)
 	Flush(ctx context.Context, handle string) (FlushResp, error)
 	Restore(ctx context.Context, r RestoreReq) (RestoreResp, error)
+	Checkpoint(ctx context.Context, handle string) (CheckpointResp, error)
 	Close(ctx context.Context, handle string) error
 	Health(ctx context.Context) (WorkerAdvert, error)
 }
@@ -213,7 +239,10 @@ func (c *HTTPClient) Restore(ctx context.Context, r RestoreReq) (RestoreResp, er
 	// string field, so it must be text-safe. Infrequent (M3+ failover
 	// only), never the hot path — unlike Push's raw binary body, where
 	// the same argument would cost 33% on every one of ~50 msg/sec.
-	body := map[string]string{"checkpoint_blob": base64.StdEncoding.EncodeToString(r.CheckpointBlob)}
+	body := map[string]any{
+		"checkpoint_blob":  base64.StdEncoding.EncodeToString(r.CheckpointBlob),
+		"last_seq_applied": r.LastSeqApplied,
+	}
 	resp, err := c.postJSON(ctx, "/v1/stream/restore", body, &out)
 	if err != nil {
 		return RestoreResp{}, err
@@ -226,6 +255,37 @@ func (c *HTTPClient) Restore(ctx context.Context, r RestoreReq) (RestoreResp, er
 		return RestoreResp{}, fmt.Errorf("backend: restore: unexpected status %d", resp.StatusCode)
 	}
 	return out, nil
+}
+
+// Checkpoint asks the currently-pinned worker to serialize its own state
+// for handle. 501/ErrNotSupported when Capabilities.Serializable is
+// false — the caller (internal/coord's async checkpoint loop) treats that
+// as "nothing to store", not an error worth logging on every push
+// (invariant 13: checkpoint failure must never take down healthy
+// inference, and "not supported" isn't even a failure, just a fact about
+// this adapter).
+func (c *HTTPClient) Checkpoint(ctx context.Context, handle string) (CheckpointResp, error) {
+	var out struct {
+		CheckpointBlob string `json:"checkpoint_blob"`
+		Generation     uint64 `json:"generation"`
+		LastSeqApplied uint64 `json:"last_seq_applied"`
+	}
+	resp, err := c.postJSON(ctx, "/v1/stream/checkpoint", map[string]string{"handle": handle}, &out)
+	if err != nil {
+		return CheckpointResp{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotImplemented {
+		return CheckpointResp{}, ErrNotSupported
+	}
+	if resp.StatusCode != http.StatusOK {
+		return CheckpointResp{}, fmt.Errorf("backend: checkpoint: unexpected status %d", resp.StatusCode)
+	}
+	blob, err := base64.StdEncoding.DecodeString(out.CheckpointBlob)
+	if err != nil {
+		return CheckpointResp{}, fmt.Errorf("backend: checkpoint: decode blob: %w", err)
+	}
+	return CheckpointResp{CheckpointBlob: blob, Generation: out.Generation, LastSeqApplied: out.LastSeqApplied}, nil
 }
 
 func (c *HTTPClient) Close(ctx context.Context, handle string) error {

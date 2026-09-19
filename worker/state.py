@@ -40,9 +40,20 @@ class StateStore:
         self._records: dict[str, SessionRecord] = {}
         self._registry_lock = threading.Lock()
 
-    def open(self, session_id: str, model_state: Any) -> SessionRecord:
+    def open(self, session_id: str, model_state: Any, *, last_seq_applied: int = 0) -> SessionRecord:
+        """last_seq_applied defaults to 0 (a genuinely fresh session) but
+        the restore path (worker/server.py's /v1/stream/restore) passes
+        the checkpoint's own seq — the new handle starts at generation 0
+        either way (it's a fresh record in THIS worker's store; generation
+        numbers are worker-local and never need to match the dead
+        worker's numbering — the coordinator reads back whatever this
+        call returns and uses that from here on), but last_seq_applied
+        must reflect how much audio the checkpoint already accounts for,
+        or the coordinator would redundantly (though harmlessly, thanks
+        to idempotent replay) resend audio this state already reflects.
+        """
         handle = str(uuid.uuid4())
-        rec = SessionRecord(handle=handle, session_id=session_id, model_state=model_state)
+        rec = SessionRecord(handle=handle, session_id=session_id, model_state=model_state, last_seq_applied=last_seq_applied)
         with self._registry_lock:
             self._records[handle] = rec
         return rec

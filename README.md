@@ -9,15 +9,18 @@ cache, routing, replay, failover and observability.
 
 ## Status
 
-**Skeleton (M0).** `docker compose up` brings up the gateway and a fleet
-of five identity-only workers, all passing health checks. No WebSocket
-session handling, no inference, no failover yet — see the build plan below
-for what's built versus what's scaffolded.
+**M3 — failover and chaos recovery.** The gateway streams audio over the
+wire protocol, journals it, pins each session to a capability-compatible
+worker, checkpoints mock state asynchronously, and recovers from worker
+failure through either compatible restore + tail replay or fresh-state
+audio replay. `make chaos` verifies scenarios 2, 3, and 5 against the
+real Compose fleet.
 
 ```bash
 ./scripts/check_env.sh   # verify go/python/docker/compose are present
 make up                  # docker compose up --build
 make down                # docker compose down -v
+make chaos               # M3 real-stack failover scenarios 2, 3, and 5
 ```
 
 ### Troubleshooting

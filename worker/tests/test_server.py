@@ -108,6 +108,140 @@ def test_restore_round_trips_with_serializable_adapter():
     assert body["handle"]
 
 
+def test_restore_carries_last_seq_applied_from_the_checkpoint():
+    from adapters.mock import MockState
+
+    st = MockState(session_id="orig", chunks_seen=1, tokens=["a"])
+    blob = server.adapter.serialize(st)
+
+    r = client.post(
+        "/v1/stream/restore",
+        json={"checkpoint_blob": base64.b64encode(blob).decode(), "last_seq_applied": 1180},
+    )
+    assert r.status_code == 200
+    assert r.json()["last_seq_applied"] == 1180
+
+
+def test_restore_rejects_a_corrupted_blob():
+    # docs/build-plan.md's checkpoint design: "Validation failure means
+    # audio replay. Never partial-restore, never coerce." — a blob that
+    # fails to deserialize must be a clean, distinguishable error, not a
+    # 500 or a silently-wrong partial state.
+    r = client.post("/v1/stream/restore", json={"checkpoint_blob": base64.b64encode(b"not a real pickle").decode()})
+    assert r.status_code == 422
+    assert r.json()["error"] == "invalid_checkpoint"
+
+
+def test_checkpoint_round_trips_through_push_and_restore():
+    """The full M3 loop: open, push (real state), checkpoint (serialize
+    it), restore that exact blob into a FRESH handle, and confirm the new
+    handle's state reflects the checkpointed history — not a fresh/empty
+    one."""
+    handle = _open("checkpoint-loop")["handle"]
+    audio = b"\x00\x01" * 320
+    push = client.post(
+        "/v1/stream/push",
+        content=audio,
+        headers={**AUDIO_HEADERS_CT, "X-Handle": handle, "X-Seq-Start": "0", "X-Seq-End": "10", "X-Expected-Generation": "0"},
+    ).json()
+    assert push["text"] == "mock1"
+
+    cp = client.post("/v1/stream/checkpoint", json={"handle": handle})
+    assert cp.status_code == 200
+    cp_body = cp.json()
+    assert cp_body["generation"] == push["generation"]
+    assert cp_body["last_seq_applied"] == 10
+
+    restored = client.post(
+        "/v1/stream/restore",
+        json={"checkpoint_blob": cp_body["checkpoint_blob"], "last_seq_applied": cp_body["last_seq_applied"]},
+    )
+    assert restored.status_code == 200
+    restored_body = restored.json()
+    assert restored_body["last_seq_applied"] == 10
+    assert restored_body["handle"] != handle  # a genuinely new handle, not the same session
+
+    # Finalizing the RESTORED handle must reflect the pre-checkpoint
+    # history ("mock1"), proving state actually round-tripped rather than
+    # the restored handle starting fresh.
+    final = client.post("/v1/stream/flush", json={"handle": restored_body["handle"]})
+    assert final.json()["text"] == "mock1"
+
+
+def test_checkpoint_unknown_handle_returns_404():
+    r = client.post("/v1/stream/checkpoint", json={"handle": "does-not-exist"})
+    assert r.status_code == 404
+
+
+def test_checkpoint_returns_501_when_adapter_is_not_serializable(monkeypatch):
+    from adapters.base import Capabilities
+
+    monkeypatch.setattr(
+        server.adapter,
+        "capabilities",
+        lambda: Capabilities(
+            streaming=True, serializable=False, endpointing=False,
+            modes=frozenset({"online"}), min_chunk_ms=20, max_chunk_ms=5000,
+        ),
+    )
+    handle = _open("s-not-serializable")["handle"]
+    r = client.post("/v1/stream/checkpoint", json={"handle": handle})
+    assert r.status_code == 501
+    assert r.json()["error"] == "not_supported"
+
+
+def test_admin_corrupt_flag_makes_checkpoint_unrestorable():
+    """The worker-side half of scenario 5's fault: /admin/corrupt flips
+    every byte of what /v1/stream/checkpoint returns, so a blob taken
+    while it's on fails to deserialize on restore — the same
+    invalid_checkpoint path a gateway-side corruption would hit."""
+    handle = _open("s-corrupt")["handle"]
+    client.post(
+        "/v1/stream/push",
+        content=b"\x00\x01" * 320,
+        headers={**AUDIO_HEADERS_CT, "X-Handle": handle, "X-Seq-Start": "0", "X-Seq-End": "10", "X-Expected-Generation": "0"},
+    )
+    try:
+        r = client.post("/admin/corrupt", json={"on": True})
+        assert r.json()["corrupt"] is True
+
+        cp = client.post("/v1/stream/checkpoint", json={"handle": handle}).json()
+        restored = client.post("/v1/stream/restore", json={"checkpoint_blob": cp["checkpoint_blob"]})
+        assert restored.status_code == 422
+    finally:
+        client.post("/admin/reset")  # never leak fault state into other tests
+
+
+def test_admin_slow_and_429_and_reset():
+    try:
+        r = client.post("/admin/slow", json={"ms": 5})
+        assert r.json()["slow_ms"] == 5
+
+        r = client.post("/admin/429", json={"rate": 1.0})  # always trip, deterministic for the test
+        assert r.json()["rate"] == 1.0
+
+        handle = _open("s-fault")["handle"]
+        pushed = client.post(
+            "/v1/stream/push",
+            content=b"\x00\x01" * 320,
+            headers={**AUDIO_HEADERS_CT, "X-Handle": handle, "X-Seq-Start": "0", "X-Seq-End": "10", "X-Expected-Generation": "0"},
+        )
+        assert pushed.status_code == 429
+        assert pushed.headers.get("retry-after") == "1"
+    finally:
+        r = client.post("/admin/reset")
+        assert r.json() == {"reset": True}
+
+    # After reset, push must succeed normally again.
+    handle = _open("s-after-reset")["handle"]
+    pushed = client.post(
+        "/v1/stream/push",
+        content=b"\x00\x01" * 320,
+        headers={**AUDIO_HEADERS_CT, "X-Handle": handle, "X-Seq-Start": "0", "X-Seq-End": "10", "X-Expected-Generation": "0"},
+    )
+    assert pushed.status_code == 200
+
+
 def test_restore_returns_501_when_adapter_is_not_serializable(monkeypatch):
     from adapters.base import Capabilities
 

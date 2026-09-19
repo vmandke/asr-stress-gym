@@ -70,12 +70,11 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` pending
 
 ## M3 — failover, both modes (the thesis)
 
-- [ ] Router: filter/score `Pick`, session pinning
-- [ ] Health: latency ejection vs. cluster p95, probing recovery
-- [ ] Fault injection via supervisor (`die`/`restore`/`slow`/`blackhole`/`429`/`corrupt`)
-- [ ] Checkpointing on mock adapter
-- [ ] Both recovery algorithms as one bounded loop (defect #6 fix — no unbounded recursion)
-- [ ] **Done-when:** chaos scenarios 2, 3, 5 pass headlessly, non-zero exit on breach, `duplicate_finals_total == 0` in all three
+- [x] Router: filter/score `Pick`, capability filtering, session pinning, reactive error/latency health and single-probe recovery
+- [x] Fault injection: process-level supervisor (`die`/`restore`) plus mock-worker controls (`slow`/`blackhole`/`429`/`corrupt`)
+- [x] Gateway-side asynchronous mock checkpoints; validation failure degrades safely to audio replay
+- [x] Both recovery algorithms in one bounded loop (defect #6 fix — no unbounded recursion); failed replacement attempts restore the prior owner and close their temporary handle
+- [x] **Done-when, verified against the real Compose fleet:** `make chaos` runs scenarios 2, 3, and 5 headlessly, exits non-zero on a breach, and asserts `duplicate_finals_total == 0` in each. The runner resets worker children and the gateway's in-memory health view between scenarios, because each scenario intentionally changes it.
 
 ## M4 — the audio pipeline
 
@@ -137,10 +136,10 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` pending
 | 3 | Replay undefined over silence | M1 (`Recut` skips non-voiced) + M2 (journal retains everything) | [x] journal stores every record, voiced or not (`TestSilenceNeverEntersChunkContent` + journal's own completeness); no separate dispatch-log structure needed — see M2's design refinement below |
 | 4 | Chunk boundaries not preserved on replay | M1 (`Recut`) + M2 (journal integration proven) | [x] `TestJournalRecordsFeedRecutCorrectly` confirms journal-stored records feed `Recut` and reproduce live dispatch exactly |
 | 5 | `audio_b64` contradicts the doc's own base64 rejection | M1 (binary body) | [x] `Push` is a true binary body; verified against the real worker, not just the fake one |
-| 6 | Unbounded recursion in `handleBackendFailure` | M3 (bounded loop) | [ ] |
+| 6 | Unbounded recursion in `handleBackendFailure` | M3 (bounded loop) | [x] explicit `MaxFailoverAttempts` loop, with failed candidates excluded |
 | 7 | No `ack` event for client-side replay | M2 | [x] early: `ack` implemented and wired at M1 (piggybacks session_id delivery on session.start's ack too) |
 | 8 | `TrimBefore` can discard pre-roll | M2 (current scope) / M4 (full formula) | [x] safe for M1/M2's actual shape — one utterance per session, trimmed once at its own final, no "still-open utterance" case can exist yet; the full `min(committedSeq, openUtteranceStart)` formula is only meaningful once M4 allows a new utterance to already be open when an earlier one's final commits |
-| 9 | "Continue without reset" needs unsafe text diffing | M3 (always reset) | [ ] |
+| 9 | "Continue without reset" needs unsafe text diffing | M3 (always reset) | [x] every successful recovery emits `partial.reset` before any regenerated partial |
 | 10 | No finals-dedupe structure specified | M2 | [x] `Emitter`'s dedupe is now correctly per-utterance (not session-wide — a real bug found and fixed this milestone, see below), proven by `TestUtterancesAreIndependentAfterNewUtterance` |
 | 11 | Non-streaming adapters have no capability signal | M5/M6 (`Capabilities`) | [x] early: `Capabilities` struct implemented and returned from `open` at M1, ahead of its M6 router caller |
 | 12 | Thesis scheduled as phase 5 of 7 | M3 (moved up) | [x] resequenced in the plan |

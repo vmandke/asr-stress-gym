@@ -31,9 +31,10 @@ type CacheCompatibilityKey string
 // contracts: this is what defect #1 (three conflicting backend
 // interfaces) collapses down to on the gateway side.
 type InferenceState struct {
-	SessionID   string
-	UtteranceID uint64
-	Mode        Mode
+	SessionID    string
+	UtteranceID  uint64
+	Mode         Mode
+	SampleRateHz int // set once from session.start, alongside Mode — needed again at M3 to re-Open against a replacement worker on failover
 
 	// ownership
 	WorkerID         string

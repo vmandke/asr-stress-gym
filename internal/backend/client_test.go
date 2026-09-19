@@ -93,8 +93,29 @@ func fakeWorker(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	mux.HandleFunc("/v1/stream/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Handle string `json:"handle"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if body.Handle != "handle-1" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"checkpoint_blob":  base64.StdEncoding.EncodeToString(wantCheckpointBlob),
+			"generation":       3,
+			"last_seq_applied": 42,
+		})
+	})
+
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(WorkerAdvert{WorkerID: "worker-mock", Status: "READY"})
+		json.NewEncoder(w).Encode(WorkerAdvert{
+			WorkerID:             "worker-mock",
+			Status:               "READY",
+			CompatibilityKeyHash: "sha256:mock",
+			Capabilities:         Capabilities{Streaming: true, Serializable: true, Modes: []string{"online", "offline"}},
+		})
 	})
 
 	return httptest.NewServer(mux)
@@ -187,5 +208,42 @@ func TestHTTPClientCloseAndHealth(t *testing.T) {
 	}
 	if adv.WorkerID != "worker-mock" || adv.Status != "READY" {
 		t.Fatalf("got %+v", adv)
+	}
+	// M3: /health must carry Capabilities too — the router filters and
+	// scores from a single startup Health() call, before it ever Opens a
+	// session against a candidate.
+	if !adv.Capabilities.Streaming || !adv.Capabilities.Serializable {
+		t.Fatalf("got Capabilities %+v, want streaming+serializable", adv.Capabilities)
+	}
+	if adv.CompatibilityKeyHash != "sha256:mock" {
+		t.Fatalf("got CompatibilityKeyHash %q, want sha256:mock", adv.CompatibilityKeyHash)
+	}
+}
+
+func TestHTTPClientCheckpoint(t *testing.T) {
+	srv := fakeWorker(t)
+	defer srv.Close()
+	c := NewHTTPClient(srv.URL)
+
+	resp, err := c.Checkpoint(context.Background(), "handle-1")
+	if err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if string(resp.CheckpointBlob) != string(wantCheckpointBlob) {
+		t.Fatalf("got blob %q, want %q", resp.CheckpointBlob, wantCheckpointBlob)
+	}
+	if resp.Generation != 3 || resp.LastSeqApplied != 42 {
+		t.Fatalf("got %+v", resp)
+	}
+}
+
+func TestHTTPClientCheckpointUnknownHandle(t *testing.T) {
+	srv := fakeWorker(t)
+	defer srv.Close()
+	c := NewHTTPClient(srv.URL)
+
+	_, err := c.Checkpoint(context.Background(), "no-such-handle")
+	if err == nil {
+		t.Fatal("expected an error for an unknown handle")
 	}
 }

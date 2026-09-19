@@ -1,17 +1,26 @@
-"""ASR Stress Gym worker process: the open/push/flush/restore/close/health
-HTTP surface from docs/PROTOCOL.md, hosting whichever Adapter ADAPTER
-selects (worker/adapters/registry.py). One env var swaps the model and
-touches no Go code — see docs/implementation-plan.md, "Adapter registry
-and conformance".
+"""ASR Stress Gym worker process: the open/push/flush/restore/checkpoint/
+close/health HTTP surface from docs/PROTOCOL.md, hosting whichever
+Adapter ADAPTER selects (worker/adapters/registry.py). One env var swaps
+the model and touches no Go code — see docs/implementation-plan.md,
+"Adapter registry and conformance".
 
 `push` reads a raw binary body (PCM bytes) with metadata in headers, not
 JSON — implementation-plan.md defect #5. Every other endpoint is JSON.
+
+Request-level fault injection (slow/blackhole/429/corrupt) lives here, as
+module state toggled by /admin/*. Process-level fault injection (die/
+restore) does NOT: this process can't resurrect itself after os._exit(),
+so that needs a separate, surviving parent — see supervisor.py, which
+spawns this file as a child and is what the worker's Docker CMD actually
+runs.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
+import random
 import time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -26,11 +35,22 @@ MODEL = os.environ.get("MODEL", "unset")
 ADAPTER_NAME = os.environ.get("ADAPTER", "mock")
 PORT = int(os.environ.get("HEALTH_PORT", "9000"))
 
-adapter = build_adapter(ADAPTER_NAME)
+# MODEL doubles as the mock adapter's identity (see adapters/mock.py) —
+# worker-a/worker-b share a MODEL value and so share a compatibility key;
+# worker-c's differs. No separate env var: compose already assigns MODEL
+# per fleet member for display purposes, so this reuses it rather than
+# adding a second knob that could drift from the first.
+adapter = build_adapter(ADAPTER_NAME, model_id=None if MODEL == "unset" else MODEL)
 store = StateStore()
 STARTED_AT = time.time()
 
 app = FastAPI()
+
+# --- fault injection state (module-level; single worker process) ---
+_fault_slow_ms = 0
+_fault_blackhole = False
+_fault_429_rate = 0.0
+_fault_corrupt = False
 
 
 @app.get("/health")
@@ -40,6 +60,7 @@ def health() -> dict:
         "status": "READY",
         "model": MODEL,
         "compatibility_key_hash": adapter.compatibility_key().hash(),
+        "capabilities": adapter.capabilities().to_json(),
         "active_sessions": store.count(),
         "state_bytes": 0,  # real accounting lands with the real adapters (M5)
         "queue_depth": 0,
@@ -64,6 +85,13 @@ async def stream_open(request: Request) -> dict:
 
 @app.post("/v1/stream/push")
 async def stream_push(request: Request):
+    if _fault_blackhole:
+        await asyncio.sleep(3600)  # accept the connection, never respond
+    if _fault_slow_ms:
+        await asyncio.sleep(_fault_slow_ms / 1000)
+    if _fault_429_rate and random.random() < _fault_429_rate:
+        return JSONResponse(status_code=429, headers={"Retry-After": "1"}, content={"error": "rate_limited"})
+
     handle = request.headers.get("X-Handle", "")
     seq_end = int(request.headers.get("X-Seq-End", "0"))
     expected_generation = int(request.headers.get("X-Expected-Generation", "0"))
@@ -122,12 +150,52 @@ async def stream_restore(request: Request):
         model_state = adapter.deserialize(blob)
     except NotSupported:
         return JSONResponse(status_code=501, content={"error": "not_supported"})
+    except Exception:
+        # A corrupted/malformed blob (whether corrupted here via
+        # /admin/corrupt or gateway-side) must fail validation, not crash
+        # the worker or silently coerce — build-plan.md's checkpoint
+        # design: "Validation failure means audio replay. Never
+        # partial-restore, never coerce."
+        return JSONResponse(status_code=422, content={"error": "invalid_checkpoint"})
 
-    # session_id isn't known from a checkpoint blob alone at M1; the
-    # coordinator supplies the real session on the M3 restore path, which
-    # also carries the seq the checkpoint was taken at.
-    rec = store.open("restored", model_state)
-    return {"handle": rec.handle, "generation": rec.generation, "last_seq_applied": 0}
+    # session_id isn't known from a checkpoint blob alone; the
+    # coordinator's restore path supplies the real session. last_seq_applied
+    # comes from the checkpoint itself (the coordinator read it back from
+    # /v1/stream/checkpoint when it took the checkpoint) so this fresh
+    # record correctly reflects how much audio the restored state already
+    # accounts for.
+    last_seq_applied = int(body.get("last_seq_applied", 0))
+    rec = store.open("restored", model_state, last_seq_applied=last_seq_applied)
+    return {"handle": rec.handle, "generation": rec.generation, "last_seq_applied": rec.last_seq_applied}
+
+
+@app.post("/v1/stream/checkpoint")
+async def stream_checkpoint(request: Request):
+    """Serialize handle's current state for the gateway to hold onto.
+    Checkpoints live gateway-side (internal/coord), not here — see
+    internal/backend.CheckpointResp's doc comment for why. This endpoint
+    is the worker's half of that: produce the blob on request, own
+    nothing about its storage or lifetime afterward.
+    """
+    caps = adapter.capabilities()
+    if not caps.serializable:
+        return JSONResponse(status_code=501, content={"error": "not_supported"})
+
+    body = await request.json()
+    try:
+        rec = store.get(body["handle"])
+    except HandleNotFound:
+        raise HTTPException(status_code=404, detail="unknown handle") from None
+
+    blob = adapter.serialize(rec.model_state)
+    if _fault_corrupt:
+        blob = bytes([b ^ 0xFF for b in blob])  # deterministically corrupt every byte
+
+    return {
+        "checkpoint_blob": base64.b64encode(blob).decode(),
+        "generation": rec.generation,
+        "last_seq_applied": rec.last_seq_applied,
+    }
 
 
 @app.post("/v1/stream/close")
@@ -137,10 +205,55 @@ async def stream_close(request: Request) -> dict:
     return {}
 
 
+# --- fault injection admin API (request-level only; see module docstring) ---
+
+
+@app.post("/admin/slow")
+async def admin_slow(request: Request) -> dict:
+    global _fault_slow_ms
+    body = await request.json()
+    _fault_slow_ms = int(body.get("ms", 0))
+    return {"slow_ms": _fault_slow_ms}
+
+
+@app.post("/admin/blackhole")
+async def admin_blackhole(request: Request) -> dict:
+    global _fault_blackhole
+    body = await request.json()
+    _fault_blackhole = bool(body.get("on", False))
+    return {"blackhole": _fault_blackhole}
+
+
+@app.post("/admin/429")
+async def admin_429(request: Request) -> dict:
+    global _fault_429_rate
+    body = await request.json()
+    _fault_429_rate = float(body.get("rate", 0.0))
+    return {"rate": _fault_429_rate}
+
+
+@app.post("/admin/corrupt")
+async def admin_corrupt(request: Request) -> dict:
+    global _fault_corrupt
+    body = await request.json()
+    _fault_corrupt = bool(body.get("on", False))
+    return {"corrupt": _fault_corrupt}
+
+
+@app.post("/admin/reset")
+async def admin_reset() -> dict:
+    global _fault_slow_ms, _fault_blackhole, _fault_429_rate, _fault_corrupt
+    _fault_slow_ms = 0
+    _fault_blackhole = False
+    _fault_429_rate = 0.0
+    _fault_corrupt = False
+    return {"reset": True}
+
+
 def main() -> None:
     import uvicorn
 
-    print(f"worker[{WORKER_ID}]: adapter={ADAPTER_NAME} listening on :{PORT}")
+    print(f"worker[{WORKER_ID}]: adapter={ADAPTER_NAME} model={MODEL} listening on :{PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
 

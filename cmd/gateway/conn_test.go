@@ -2,16 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 
+	"asr-stress-gym/internal/coord"
 	"asr-stress-gym/internal/wire"
 )
 
@@ -29,22 +32,38 @@ type fakeWorkerRecord struct {
 
 func newFakeWorker(t *testing.T) *httptest.Server {
 	t.Helper()
+	srv, _ := newFakeWorkerNamed(t, "fake", "sha256:fake")
+	return srv
+}
+
+// newFakeWorkerNamed is the general form: namePrefix keeps handles from
+// two simultaneously-running fake workers distinguishable in logs, key
+// lets a test build two workers that either share a compatibility key
+// (same-model failover) or don't (cross-model). Returns a push counter
+// so a test can determine WHICH of several registered workers a Pick
+// actually selected — router.Pick's tie-breaking among equally-scored
+// candidates isn't deterministic (workers come from a map in
+// buildRouter), so tests that need to kill "whichever one is currently
+// serving" read this rather than assuming a fixed order.
+func newFakeWorkerNamed(t *testing.T, namePrefix, key string) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
 	var (
-		mu      sync.Mutex
-		records = map[string]*fakeWorkerRecord{}
-		nextID  = 0
+		mu        sync.Mutex
+		records   = map[string]*fakeWorkerRecord{}
+		nextID    = 0
+		pushCount atomic.Int64
 	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/stream/open", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		nextID++
-		handle := fmt.Sprintf("fake-handle-%d", nextID)
+		handle := fmt.Sprintf("%s-handle-%d", namePrefix, nextID)
 		records[handle] = &fakeWorkerRecord{}
 		mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{
 			"handle":                 handle,
-			"compatibility_key_hash": "sha256:fake",
+			"compatibility_key_hash": key,
 			"capabilities": map[string]any{
 				"streaming": true, "serializable": true, "endpointing": false,
 				"modes": []string{"online", "offline"}, "min_chunk_ms": 20, "max_chunk_ms": 5000,
@@ -54,6 +73,7 @@ func newFakeWorker(t *testing.T) *httptest.Server {
 	})
 
 	mux.HandleFunc("/v1/stream/push", func(w http.ResponseWriter, r *http.Request) {
+		pushCount.Add(1)
 		handle := r.Header.Get("X-Handle")
 		var seqEnd, expectedGen uint64
 		fmt.Sscanf(r.Header.Get("X-Seq-End"), "%d", &seqEnd)
@@ -89,7 +109,9 @@ func newFakeWorker(t *testing.T) *httptest.Server {
 	})
 
 	mux.HandleFunc("/v1/stream/flush", func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Handle string `json:"handle"` }
+		var body struct {
+			Handle string `json:"handle"`
+		}
 		json.NewDecoder(r.Body).Decode(&body)
 		mu.Lock()
 		rec := records[body.Handle]
@@ -104,7 +126,9 @@ func newFakeWorker(t *testing.T) *httptest.Server {
 	})
 
 	mux.HandleFunc("/v1/stream/close", func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Handle string `json:"handle"` }
+		var body struct {
+			Handle string `json:"handle"`
+		}
 		json.NewDecoder(r.Body).Decode(&body)
 		mu.Lock()
 		delete(records, body.Handle)
@@ -112,11 +136,64 @@ func newFakeWorker(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"worker_id": "fake", "status": "READY"})
+	mux.HandleFunc("/v1/stream/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Handle string `json:"handle"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		rec := records[body.Handle]
+		mu.Unlock()
+		if rec == nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{
+			"checkpoint_blob":  base64.StdEncoding.EncodeToString([]byte(rec.lastText)),
+			"generation":       rec.generation,
+			"last_seq_applied": rec.lastSeqApplied,
+		})
 	})
 
-	return httptest.NewServer(mux)
+	mux.HandleFunc("/v1/stream/restore", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			CheckpointBlob string `json:"checkpoint_blob"`
+			LastSeqApplied uint64 `json:"last_seq_applied"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		blob, err := base64.StdEncoding.DecodeString(body.CheckpointBlob)
+		if err != nil {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		mu.Lock()
+		nextID++
+		handle := fmt.Sprintf("%s-restored-%d", namePrefix, nextID)
+		records[handle] = &fakeWorkerRecord{lastSeqApplied: body.LastSeqApplied, lastText: string(blob)}
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"handle": handle, "generation": 0, "last_seq_applied": body.LastSeqApplied})
+	})
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		// M3: buildRouter's startup Health() call needs capabilities and a
+		// compatibility key hash to construct a usable router.Worker — an
+		// empty Capabilities{} would fail Pick's streaming filter for
+		// EVERY online session, silently breaking every test in this file
+		// that doesn't specifically exercise that filter.
+		json.NewEncoder(w).Encode(map[string]any{
+			"worker_id":              namePrefix,
+			"status":                 "READY",
+			"compatibility_key_hash": key,
+			"capabilities": map[string]any{
+				"streaming": true, "serializable": true, "endpointing": false,
+				"modes": []string{"online", "offline"}, "min_chunk_ms": 20, "max_chunk_ms": 5000,
+			},
+		})
+	})
+
+	return httptest.NewServer(mux), &pushCount
 }
 
 // --- test harness: a real gateway ws endpoint over the fake worker ---
@@ -126,7 +203,38 @@ func newTestGateway(t *testing.T) string {
 	worker := newFakeWorker(t)
 	t.Cleanup(worker.Close)
 
-	cfg := connConfig{workerBaseURL: worker.URL}
+	// buildRouter (cmd/gateway/main.go) is the SAME startup path
+	// production uses — reused here rather than hand-rolling a second
+	// router.NewWorker construction that could silently drift from it.
+	rt := buildRouter(map[string]string{"fake": worker.URL})
+	if len(rt.Workers()) == 0 {
+		t.Fatal("buildRouter found no usable worker — check the fake /health handler above")
+	}
+	cfg := connConfig{Router: rt, Checkpoints: coord.NewCheckpointStore()}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			t.Logf("ws accept: %v", err)
+			return
+		}
+		handleConnection(r.Context(), ws, cfg)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return "ws" + srv.URL[len("http"):] + "/ws"
+}
+
+// newTestGatewayFromWorkers is newTestGateway's multi-worker form, for
+// tests that need a real router.Router with more than one candidate —
+// i.e. the failover tests below.
+func newTestGatewayFromWorkers(t *testing.T, urls map[string]string) string {
+	t.Helper()
+	rt := buildRouter(urls)
+	if len(rt.Workers()) != len(urls) {
+		t.Fatalf("buildRouter found %d workers, want %d (check each fake's /health handler)", len(rt.Workers()), len(urls))
+	}
+	cfg := connConfig{Router: rt, Checkpoints: coord.NewCheckpointStore()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
@@ -341,5 +449,173 @@ func TestFinalIsNotFollowedByFurtherEvents(t *testing.T) {
 	_, _, err := c.Read(ctx)
 	if err == nil {
 		t.Fatal("expected the connection to close after final, but it stayed open")
+	}
+}
+
+// --- M3: failover, exercised over the REAL WebSocket protocol end to
+// end. internal/coord's own tests already prove the recovery algorithms
+// correct against a fake backend.Client directly; these prove the FULL
+// wiring — WS -> sessionLoop -> router -> coord -> HTTP -> fake worker —
+// actually connects, which is exactly the kind of thing M1's own bugs
+// (found only by running the real stack) showed unit tests alone miss. ---
+
+// killWhicheverWorkerIsPinned looks at both push counters to determine
+// which fake worker the router actually selected — Pick's tie-breaking
+// among equally-scored candidates isn't deterministic (buildRouter builds
+// from a map), so tests can't assume a fixed pick order. Closing an
+// httptest.Server makes its URL start refusing connections, which is
+// what a real dead worker looks like over HTTP — no fault-injection flag
+// needed to simulate this.
+func killWhicheverWorkerIsPinned(t *testing.T, a, b *httptest.Server, pushesA, pushesB *atomic.Int64) (dead, survivor *httptest.Server, survivorPushes *atomic.Int64) {
+	t.Helper()
+	switch {
+	case pushesA.Load() > 0:
+		dead, survivor, survivorPushes = a, b, pushesB
+	case pushesB.Load() > 0:
+		dead, survivor, survivorPushes = b, a, pushesA
+	default:
+		t.Fatal("neither worker received a push — no chunk was ever dispatched")
+	}
+	dead.Close()
+	return dead, survivor, survivorPushes
+}
+
+func TestSameModelFailoverOverRealConnection(t *testing.T) {
+	const sharedKey = "sha256:shared-key"
+	workerA, pushesA := newFakeWorkerNamed(t, "worker-a", sharedKey)
+	workerB, pushesB := newFakeWorkerNamed(t, "worker-b", sharedKey)
+	t.Cleanup(workerA.Close) // no-op if the test already closed it
+	t.Cleanup(workerB.Close)
+
+	wsURL := newTestGatewayFromWorkers(t, map[string]string{"worker-a": workerA.URL, "worker-b": workerB.URL})
+	c := dial(t, wsURL)
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	sendControl(t, c, 0, sessionStartJSON)
+	readEvent(t, c) // ack
+
+	// 8 * 20ms = 160ms = one chunk at the online chunkMs — enough for the
+	// pinned worker to actually receive a push.
+	for seq := uint64(1); seq <= 8; seq++ {
+		sendAudio(t, c, seq, 20)
+	}
+	if p := readEvent(t, c); p["type"] != "partial" {
+		t.Fatalf("got %v, want partial", p)
+	}
+	readEvent(t, c) // ack
+
+	time.Sleep(50 * time.Millisecond) // best-effort: give the async checkpoint goroutine a chance to land
+
+	_, _, survivorPushes := killWhicheverWorkerIsPinned(t, workerA, workerB, pushesA, pushesB)
+
+	// The next full chunk's Push hits the dead worker and triggers
+	// coord.HandleBackendFailure inside dispatchChunk.
+	for seq := uint64(9); seq <= 16; seq++ {
+		sendAudio(t, c, seq, 20)
+	}
+
+	reset := readEvent(t, c)
+	if reset["type"] != "partial.reset" {
+		t.Fatalf("got %v, want partial.reset — the client must be told to discard its display on ANY failover, same-model included (implementation-plan.md defect #9)", reset)
+	}
+	if reset["failover_epoch"].(float64) != 1 {
+		t.Fatalf("failover_epoch = %v, want 1", reset["failover_epoch"])
+	}
+
+	if p := readEvent(t, c); p["type"] != "partial" {
+		t.Fatalf("got %v, want a partial resuming service after recovery", p)
+	}
+	if survivorPushes.Load() == 0 {
+		t.Fatal("the surviving (same-key) worker never received a push after failover")
+	}
+
+	sendControl(t, c, 17, `{"type":"session.end"}`)
+	final := readEvent(t, c)
+	if final["type"] != "final" {
+		t.Fatalf("got %v, want final", final)
+	}
+	if text, _ := final["text"].(string); text == "" {
+		t.Fatal("final carried empty text after failover — the session did not actually keep serving")
+	}
+}
+
+func TestCrossModelFailoverOverRealConnection(t *testing.T) {
+	workerA, pushesA := newFakeWorkerNamed(t, "worker-a", "sha256:key-1")
+	workerC, pushesC := newFakeWorkerNamed(t, "worker-c", "sha256:key-2") // deliberately a DIFFERENT key
+	t.Cleanup(workerA.Close)
+	t.Cleanup(workerC.Close)
+
+	wsURL := newTestGatewayFromWorkers(t, map[string]string{"worker-a": workerA.URL, "worker-c": workerC.URL})
+	c := dial(t, wsURL)
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	sendControl(t, c, 0, sessionStartJSON)
+	readEvent(t, c) // ack
+
+	for seq := uint64(1); seq <= 8; seq++ {
+		sendAudio(t, c, seq, 20)
+	}
+	readEvent(t, c) // partial
+	readEvent(t, c) // ack
+
+	_, _, survivorPushes := killWhicheverWorkerIsPinned(t, workerA, workerC, pushesA, pushesC)
+
+	for seq := uint64(9); seq <= 16; seq++ {
+		sendAudio(t, c, seq, 20)
+	}
+
+	reset := readEvent(t, c)
+	if reset["type"] != "partial.reset" {
+		t.Fatalf("got %v, want partial.reset", reset)
+	}
+
+	if p := readEvent(t, c); p["type"] != "partial" {
+		t.Fatalf("got %v, want a partial resuming service after cross-model recovery", p)
+	}
+	if survivorPushes.Load() == 0 {
+		t.Fatal("the surviving (different-key) worker never received a push after failover")
+	}
+
+	sendControl(t, c, 17, `{"type":"session.end"}`)
+	final := readEvent(t, c)
+	if final["type"] != "final" || final["text"] == "" {
+		t.Fatalf("got %v, want a non-empty final after cross-model failover", final)
+	}
+}
+
+// Chaos scenario 11's spirit, at unit-test scale: if EVERY candidate is
+// gone, the session must fail cleanly (an `error` event, connection
+// closes) — never hang, never panic.
+func TestFailoverWithNoSurvivingWorkerFailsCleanly(t *testing.T) {
+	workerA, _ := newFakeWorkerNamed(t, "worker-a", "sha256:key-1")
+	t.Cleanup(workerA.Close)
+
+	wsURL := newTestGatewayFromWorkers(t, map[string]string{"worker-a": workerA.URL})
+	c := dial(t, wsURL)
+	defer c.Close(websocket.StatusNormalClosure, "")
+
+	sendControl(t, c, 0, sessionStartJSON)
+	readEvent(t, c) // ack
+	for seq := uint64(1); seq <= 8; seq++ {
+		sendAudio(t, c, seq, 20)
+	}
+	readEvent(t, c) // partial
+	readEvent(t, c) // ack
+
+	workerA.Close() // the ONLY worker in the fleet dies
+
+	for seq := uint64(9); seq <= 16; seq++ {
+		sendAudio(t, c, seq, 20)
+	}
+
+	ev := readEvent(t, c)
+	if ev["type"] != "error" {
+		t.Fatalf("got %v, want error (no replacement worker exists)", ev)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := c.Read(ctx); err == nil {
+		t.Fatal("expected the connection to close after total failure, but it stayed open")
 	}
 }
