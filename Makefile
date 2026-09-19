@@ -1,6 +1,6 @@
-.PHONY: check up down build smoke test matrix demo chaos bench
+.PHONY: check up down build smoke test test-go test-worker matrix demo chaos bench
 
-# Available now (M0).
+# Available now (M0-M1).
 check:
 	./scripts/check_env.sh
 
@@ -14,16 +14,28 @@ build:
 	go build ./...
 	go vet ./...
 
+# M1: one stream end to end, against the real containerized stack (not
+# cmd/gateway's own tests, which use a fake worker) — see docs/PROTOCOL.md
+# and docs/implementation-plan.md's M1 done-when bar.
+smoke:
+	./scripts/smoke.sh
+
+test-go:
+	go test ./... -race
+
+# Creates worker/.venv on first run (it's git-ignored, so a fresh clone
+# has none) and leaves it in place for subsequent runs to reuse.
+worker/.venv/bin/pytest:
+	cd worker && python3 -m venv .venv && .venv/bin/pip install --quiet --upgrade pip && .venv/bin/pip install --quiet -e ".[dev]"
+
+test-worker: worker/.venv/bin/pytest
+	cd worker && .venv/bin/python -m pytest tests/ -v
+
+test: test-go test-worker
+
 # Land at their milestone (docs/implementation-plan.md). Each fails loudly
 # rather than pretending to pass, so `make <target>` is always an honest
 # signal of what's actually built.
-smoke:
-	@echo "make smoke: not implemented until M1 (one stream end to end)" >&2; exit 1
-
-test:
-	go test ./...
-	@echo "worker adapter conformance suite: not implemented until M1/M5" >&2; exit 1
-
 matrix:
 	@echo "make matrix: not implemented until M6 (docs/compat-matrix.md)" >&2; exit 1
 

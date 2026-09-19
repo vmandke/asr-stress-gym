@@ -35,10 +35,14 @@ container's own port is unaffected either way.
 - [`docs/implementation-plan.md`](docs/implementation-plan.md) — the
   executable milestone plan (M0–M10), the interface contracts that make it
   buildable, and the model fleet.
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the wire contract: client↔gateway
+  framing and gateway↔backend HTTP surface.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — every question the design left
   open, resolved once, up front.
 - [`docs/STATUS.md`](docs/STATUS.md) — living tracker: what's built and
   verified vs. pending, per milestone.
+- [`docs/FAQ.md`](docs/FAQ.md) — the reasoning behind locked decisions that
+  aren't self-evident from a one-line table entry.
 
 ## Repository layout
 

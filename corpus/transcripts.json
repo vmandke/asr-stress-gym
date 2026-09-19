@@ -1,0 +1,12 @@
+{
+  "01_short_greeting.wav": "Hello, this is a test of the transcription system.",
+  "02_number_transfer.wav": "Transfer five thousand rupees to Ramya.",
+  "03_number_transfer_alt.wav": "Transfer five thousand rupees to Ram.",
+  "04_short_command.wav": "Start recording now.",
+  "05_short_confirm.wav": "Yes, that is correct.",
+  "06_medium_sentence.wav": "The quick brown fox jumps over the lazy dog near the river bank.",
+  "07_digits.wav": "One two three four five six seven eight nine zero.",
+  "08_question.wav": "What is the current account balance?",
+  "09_longer_monologue.wav": "This is a longer utterance meant to exercise chunk accumulation across several inference calls, since it runs well past a single chunk boundary.",
+  "10_short_negative.wav": "No, please cancel that request."
+}

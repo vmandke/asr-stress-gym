@@ -10,12 +10,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 COPY pyproject.toml ./
-COPY server.py ./
+COPY server.py state.py ./
 COPY adapters ./adapters
 
-# M0: stdlib http.server only, so there is nothing to install yet.
-# `pip install .` starts here once pyproject.toml grows dependencies at
-# M1 (fastapi/uvicorn) and M5 (per-adapter: numpy, sherpa-onnx, ...).
+# M1: fastapi/uvicorn for the real open/push/flush/restore/close surface.
+# M5 adds one dependency per adapter as it lands: numpy, sherpa-onnx,
+# faster-whisper / ctranslate2, onnxruntime.
+RUN pip install --no-cache-dir .
 
 EXPOSE 9000
 CMD ["python3", "server.py"]

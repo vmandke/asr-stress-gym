@@ -1,9 +1,9 @@
-// Command gateway is the ASR Stress Gym gateway process.
-//
-// At this milestone (M0) it exposes only a health endpoint so the compose
-// stack can come up with green healthchecks. The WebSocket listener,
-// session coordinator, router and dashboard land in M1-M9; see
-// docs/implementation-plan.md for the milestone breakdown.
+// Command gateway is the ASR Stress Gym gateway process: owns the
+// WebSocket socket, sequence validation, the (M1 pass-through) audio
+// pipeline, and — for now, with no router yet (M3) — a direct connection
+// to one statically configured worker. See docs/implementation-plan.md
+// for the milestone breakdown and cmd/gateway/conn.go for the per-
+// connection wiring.
 package main
 
 import (
@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 var startedAt = time.Now()
@@ -25,17 +27,55 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func main() {
-	addr := os.Getenv("DASHBOARD_ADDR")
-	if addr == "" {
-		addr = ":7000"
+func wsHandler(cfg connConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// InsecureSkipVerify: this project has no auth/TLS in scope
+		// (build-plan.md's own non-goals list) and its clients — loadgen,
+		// the smoke tester — are plain Go processes that never send a
+		// browser-style Origin header. coder/websocket's default
+		// same-origin check would reject them outright; relaxing it here
+		// is a deliberate scope choice, not an oversight.
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			log.Printf("gateway: ws accept: %v", err)
+			return
+		}
+		handleConnection(r.Context(), ws, cfg)
 	}
+}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", healthHandler)
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
-	log.Printf("gateway: health endpoint listening on %s (M0 skeleton — no WS/session/router yet)", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("gateway: %v", err)
+func main() {
+	dashboardAddr := envOr("DASHBOARD_ADDR", ":7000")
+	wsAddr := envOr("WS_ADDR", ":7070")
+	// M1: no router, no pool — every session opens against one
+	// statically configured worker (build-plan.md Phase 1's own scope).
+	// Defaults to the compose service that ships with a serializable
+	// adapter, matching docs/DECISIONS.md.
+	workerURL := envOr("WORKER_URL", "http://worker-mock:9000")
+	cfg := connConfig{workerBaseURL: workerURL}
+
+	dashMux := http.NewServeMux()
+	dashMux.HandleFunc("/health", healthHandler)
+
+	wsMux := http.NewServeMux()
+	wsMux.HandleFunc("/ws", wsHandler(cfg))
+
+	go func() {
+		log.Printf("gateway: dashboard/health listening on %s", dashboardAddr)
+		if err := http.ListenAndServe(dashboardAddr, dashMux); err != nil {
+			log.Fatalf("gateway: dashboard listener: %v", err)
+		}
+	}()
+
+	log.Printf("gateway: ws listening on %s (worker=%s)", wsAddr, workerURL)
+	if err := http.ListenAndServe(wsAddr, wsMux); err != nil {
+		log.Fatalf("gateway: ws listener: %v", err)
 	}
 }

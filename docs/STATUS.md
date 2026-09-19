@@ -28,14 +28,29 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` pending
 
 ## M1 — protocol, codec, one stream end to end
 
-- [ ] `docs/PROTOCOL.md` (written before any wire code, per the plan)
-- [ ] `internal/wire`: binary frame codec; declared duration validated against actual payload length
-- [ ] Sequence validation (three-way switch: expected / duplicate / gap → `discontinuity`)
-- [ ] WS server: `readLoop` / `sessionLoop` / `writeLoop` on bounded channels
-- [ ] Pass-through `internal/audio.Pipeline` (no VAD yet — establishes the boundary, M4 fills it in)
-- [ ] Worker HTTP surface (`open`/`push`/`flush`/`close`) over the mock adapter; `worker/adapters/base.py` + mock adapter
-- [ ] `SessionInferenceState`, `CacheCompatibilityKey`, the three counters (stream/failover epoch, generation)
-- [ ] **Done-when:** `make smoke` — one stream end to end from a corpus clip; dropped frame → `discontinuity`; mismatched declared-vs-actual duration → rejected
+- [x] `docs/PROTOCOL.md` (written before any wire code, per the plan) — full contract, with an explicit "wired at M1" column per event so it won't need rewriting each milestone
+- [x] `internal/wire`: binary frame codec; declared duration validated against actual payload length; `ValidateSessionStart` enforces the locked format
+- [x] Sequence validation (three-way switch: expected / duplicate / gap → `discontinuity`) — `internal/session.SeqValidator`
+- [x] WS server: `readLoop` / `sessionLoop` / `writeLoop` on bounded channels (`cmd/gateway/conn.go`)
+- [x] Pass-through `internal/audio.Pipeline` — chunking is real (duration-accumulated, invariant 2 holds), only VAD is deferred to M4; `Flush()` added for session-end tail dispatch
+- [x] Worker HTTP surface (`open`/`push`/`flush`/`restore`/`close`) over the mock adapter; `worker/adapters/base.py` + `mock.py` + `registry.py`, `worker/state.py` (generation compare-and-commit)
+- [x] `SessionInferenceState`, `CacheCompatibilityKey` (opaque token, not the 7-field struct — see below), the three counters (stream/failover epoch, generation)
+- [x] Emission contract enforced, not just documented: `internal/session.Emitter` — revision monotonicity, final immutability (panics on violation in test builds), idempotent final re-delivery
+- [x] `corpus/`: 10 known-text clips generated via `scripts/gen_corpus.sh` (macOS `say`), committed; `internal/corpus` WAV reader (shared with `cmd/loadgen` at M7)
+- [x] `cmd/smoketest` + `scripts/smoke.sh`: real end-to-end verification against the containerized stack (not the fake worker `cmd/gateway`'s own tests use)
+- [x] **Done-when, verified via `make smoke` against the real compose stack:** one stream runs end to end from a corpus clip (tested against 4 different clips incl. the multi-chunk monologue); a dropped frame produces `discontinuity`; a frame whose declared duration disagrees with its payload produces `error` and the session terminates
+- [x] Go suite: 60+ tests across `wire`/`audio`/`session`/`backend`/`cmd/gateway`/`internal/corpus`, `-race` clean over repeated runs; Python suite: 19 tests (adapter conformance, generation compare-and-commit incl. a real concurrent-writers test, full server integration)
+
+**Design refinement made while implementing:** `CacheCompatibilityKey` on the Go side ended up as an opaque comparable string, not the 7-field struct build-plan.md's Go sample embeds. Carrying the full struct (`ModelFamily`, `Runtime`, `Dtype`, ...) into the gateway would mean the gateway knows a backend is a model — precisely what build-plan.md's own boundary rule 2 forbids. The full struct lives worker-side only (`worker/adapters/base.py`'s `CompatKey`); the Go side only ever compares the hash it produces. Documented in `internal/session/state.go`.
+
+**Bugs found and fixed during verification** (the kind `make smoke` against a real stack catches and a fake-worker unit test can't):
+
+| Bug | Where | Fix |
+|---|---|---|
+| Restore's checkpoint blob went into a JSON string via a raw byte→string cast — lossy for binary data, despite `PROTOCOL.md` already saying "base64 here" | `internal/backend.Client.Restore` | base64-encode/decode properly; strengthened the test to use deliberately invalid-UTF-8 bytes so this class of bug can't silently pass again |
+| `worker/Dockerfile` never ran `pip install`, and didn't copy the new `state.py` — both stale from the M0 stdlib-only version | `worker/Dockerfile` | install from `pyproject.toml`, copy `state.py` |
+| **Goroutine shutdown race:** both `sessionLoop` and `readLoop` called `cancel()` on their own early-return paths; that cancellation could unblock/abort a goroutine *before* `writeLoop` finished flushing the very error/final event the return just produced — intermittently dropped the last event before the client could read it | `cmd/gateway/conn.go` | only `handleConnection` cancels, and only after `<-done` confirms `writeLoop` fully drained; caught by running the integration tests with `-race -count=30`, not a single run |
+| **Client-side `coder/websocket` gotcha:** canceling a `Read`'s context (e.g. a short timeout used to "poll without blocking") closes the whole connection, not just that call — `cmd/smoketest`'s original drain loop did exactly this between every audio frame | `cmd/smoketest/main.go` | replaced with a dedicated reader goroutine on the connection's one long-lived context feeding a channel, drained via non-blocking `select`/`default` — the same shape `cmd/gateway`'s own `writeLoop` already used, which is why the server side never had this bug |
 
 ## M2 — journal, dispatch log, emission contract
 
@@ -110,20 +125,22 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` pending
 
 | # | Defect | Fixed at | Status |
 |---|---|---|---|
-| 1 | Three conflicting backend interfaces | M1 (`backend.Client` + `Adapter`) | [ ] |
-| 2 | Sample-level DSP scattered outside one boundary | M1 (stub) / M4 (real) | [x] boundary exists; [ ] filled in |
+| 1 | Three conflicting backend interfaces | M1 (`backend.Client` + `Adapter`) | [x] `internal/backend.Client` (Go↔worker) and `worker/adapters/base.Adapter` (in-process) are the only two, verified compatible end-to-end via `make smoke` |
+| 2 | Sample-level DSP scattered outside one boundary | M1 (real chunking) / M4 (VAD) | [x] duration-based chunk cutting is real and tested (invariant 2 holds); VAD gating alone deferred to M4 |
 | 3 | Replay undefined over silence | M2 (dispatch log) | [ ] |
-| 4 | Chunk boundaries not preserved on replay | M2 (`Recut`) | [ ] |
-| 5 | `audio_b64` contradicts the doc's own base64 rejection | M1 (binary body) | [ ] |
+| 4 | Chunk boundaries not preserved on replay | M2 (`Recut`) | [x] early: `audio.Pipeline.Recut` implemented and tested at M1 (byte-for-byte reproduction of live dispatch), ahead of its M2 caller |
+| 5 | `audio_b64` contradicts the doc's own base64 rejection | M1 (binary body) | [x] `Push` is a true binary body; verified against the real worker, not just the fake one |
 | 6 | Unbounded recursion in `handleBackendFailure` | M3 (bounded loop) | [ ] |
-| 7 | No `ack` event for client-side replay | M2 | [ ] |
+| 7 | No `ack` event for client-side replay | M2 | [x] early: `ack` implemented and wired at M1 (piggybacks session_id delivery on session.start's ack too) |
 | 8 | `TrimBefore` can discard pre-roll | M2 | [ ] |
 | 9 | "Continue without reset" needs unsafe text diffing | M3 (always reset) | [ ] |
-| 10 | No finals-dedupe structure specified | M2 | [ ] |
-| 11 | Non-streaming adapters have no capability signal | M5/M6 (`Capabilities`) | [ ] |
+| 10 | No finals-dedupe structure specified | M2 (multi-utterance set) | [x] single-utterance case (M1's actual scope — no VAD yet, one utterance per session) fully handled by `Emitter.Final`'s idempotency guard; the multi-utterance dedupe set is still M2 |
+| 11 | Non-streaming adapters have no capability signal | M5/M6 (`Capabilities`) | [x] early: `Capabilities` struct implemented and returned from `open` at M1, ahead of its M6 router caller |
 | 12 | Thesis scheduled as phase 5 of 7 | M3 (moved up) | [x] resequenced in the plan |
 
 ## Open risks (not yet decisions — watch these)
 
 - sherpa-onnx real-model RTF on this machine is unmeasured until M5; concurrency target (20 streams) may need revising down once measured.
 - **Docker Desktop memory is tight.** Checked via `docker info`: 14 CPUs (fine) but only **~7.75 GiB** RAM allocated to the VM, no CLI to resize it. The planned default fleet (gateway + 5 workers, M0 limits) budgets ~8 GiB at the *limits* — already at the edge before M5 adds real model weights on top of worker-a/b/c/d. Action before M5: raise Docker Desktop's memory allocation (Settings → Resources) to 16 GiB+, or trim per-worker limits once real memory footprints are measured. Not a blocker today (M0's stub workers use a fraction of their limits).
+- **Standing gotcha for any future `coder/websocket` client code** (`cmd/loadgen` at M7, the dashboard's control plane at M9, any chaos script that speaks WS directly): canceling a `Read`'s context — including via a short per-call timeout used to "check without blocking" — closes the whole connection, not just that call. Found and fixed once already in `cmd/smoketest` (see M1's bugs-found table). The safe shape is always: one dedicated reader goroutine on the connection's full-lifetime context, feeding a channel; drain that channel with a non-blocking `select`/`default`, never a fresh short-lived context per poll.
+- Minor: `worker`'s pytest run emits a `StarletteDeprecationWarning` about `httpx`/`starlette.testclient` (`pip install httpx2` suggested). Not failing anything; worth a look if it becomes a hard error in a future FastAPI/Starlette bump.

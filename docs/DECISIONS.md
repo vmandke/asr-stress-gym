@@ -7,7 +7,7 @@ each.
 
 | Question | Decision |
 |---|---|
-| Audio format | One declared format, required in `session.start`, validated not guessed. Format handling lives entirely inside `internal/audio`; the rest of the system is format-agnostic. |
+| Audio format | Mono 16kHz s16le PCM, required in `session.start`, validated not guessed. Format handling lives entirely inside `internal/audio`; the rest of the system is format-agnostic. Why this exact format: [FAQ.md](FAQ.md). |
 | Latency milestone | `final_latency_ms` (endpoint decision → `final` on the wire) p95 ≤ 300ms; `partial_latency_ms` p95 ≤ 250ms. **All server-side.** The interview's ~100ms network term is not observable inside `docker compose`; it is budgeted, not measured, and the README says so. |
 | Concurrency target | 200 concurrent online streams on the mock adapter; 20 on a real sherpa-onnx streaming adapter. Both measured and reported, not claimed in advance. |
 | Partial transcripts | Yes for online mode, no for offline mode. |
