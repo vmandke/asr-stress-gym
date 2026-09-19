@@ -1,4 +1,4 @@
-.PHONY: check up down build smoke test test-go test-worker matrix demo chaos bench
+.PHONY: check up down build smoke test test-go test-worker models rtf matrix demo chaos bench
 
 # Available now (M0-M1).
 check:
@@ -31,13 +31,28 @@ worker/.venv/bin/pytest:
 test-worker: worker/.venv/bin/pytest
 	cd worker && .venv/bin/python -m pytest tests/ -v
 
+# Weights for the real adapters. NOT a prerequisite of anything: the image
+# fetches them itself at build time (worker/Dockerfile), and the adapter
+# conformance suite SKIPS the real adapters rather than failing when they
+# are absent — a fresh clone that has never run this must still get a
+# green `make test`. Run it to exercise the real adapters on your host.
+models:
+	./models/fetch.sh
+
+# Regenerates docs/RTF.md from the adapters as they are right now. Needs
+# `make models` first, and measures the models rather than the stack —
+# end-to-end latency is a different number and belongs to `make bench` (M8).
+rtf: worker/.venv/bin/pytest
+	cd worker && .venv/bin/python ../scripts/measure_rtf.py
+
 test: test-go test-worker
 
 # Land at their milestone (docs/implementation-plan.md). Each fails loudly
 # rather than pretending to pass, so `make <target>` is always an honest
 # signal of what's actually built.
 matrix:
-	@echo "make matrix: not implemented until M6 (docs/compat-matrix.md)" >&2; exit 1
+	. ./scripts/check_env.sh && docker compose --profile models up -d --build
+	MATRIX_WORKER_URLS="worker-mock=http://localhost:$${WORKER_MOCK_PORT:-18000},worker-a=http://localhost:$${WORKER_A_PORT:-18001},worker-b=http://localhost:$${WORKER_B_PORT:-18002},worker-c=http://localhost:$${WORKER_C_PORT:-18003},worker-d=http://localhost:$${WORKER_D_PORT:-18004},worker-e=http://localhost:$${WORKER_E_PORT:-18005}" go run ./cmd/matrix
 
 demo:
 	@echo "make demo: not implemented until M3/M9 (kill a worker, watch it recover)" >&2; exit 1

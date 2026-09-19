@@ -82,10 +82,12 @@ func replayChunks(ctx context.Context, client backend.Client, deps RecoveryDeps,
 func RecoverSameModel(ctx context.Context, deps RecoveryDeps, target *router.Worker) (backend.Client, session.PartialResetEvent, *string, error) {
 	cp, ok := deps.Checkpoints.Latest(deps.State.SessionID)
 	if !ok || !CanRestore(cp, target.CompatibilityKey) {
+		metrics.CheckpointDegradedTotal.Add(1)
 		return RecoverCrossModel(ctx, deps, target)
 	}
 	resp, err := target.Client.Restore(ctx, backend.RestoreReq{CheckpointBlob: cp.StateBlob, LastSeqApplied: cp.Seq})
 	if err != nil {
+		metrics.CheckpointDegradedTotal.Add(1)
 		return RecoverCrossModel(ctx, deps, target)
 	}
 
@@ -106,7 +108,7 @@ func RecoverSameModel(ctx context.Context, deps RecoveryDeps, target *router.Wor
 		return nil, resetEv, nil, err
 	}
 	metrics.FailoverTotal.Add(1)
-	metrics.FailoverSameModelTotal.Add(1)
+	metrics.CheckpointRestoresTotal.Add(1)
 	return target.Client, resetEv, text, nil
 }
 
@@ -119,6 +121,11 @@ func RecoverSameModel(ctx context.Context, deps RecoveryDeps, target *router.Wor
 // between two workers that DO share a key — build-plan.md's own
 // pseudocode uses the same function for both, and this keeps that
 // fidelity rather than inventing a third near-identical path.
+//
+// Because of that reuse, this function does NOT decide whether a failover
+// was same-model or cross-model: reaching here says only that a full
+// replay happened, which is true of both. HandleBackendFailure owns that
+// distinction, since it is where the keys are compared.
 func RecoverCrossModel(ctx context.Context, deps RecoveryDeps, target *router.Worker) (backend.Client, session.PartialResetEvent, *string, error) {
 	resp, err := target.Client.Open(ctx, backend.OpenReq{
 		SessionID:    deps.State.SessionID,
@@ -146,7 +153,6 @@ func RecoverCrossModel(ctx context.Context, deps RecoveryDeps, target *router.Wo
 		return nil, resetEv, nil, err
 	}
 	metrics.FailoverTotal.Add(1)
-	metrics.FailoverCrossModelTotal.Add(1) // also covers RecoverSameModel's degrade path — see the doc comment above
 	return target.Client, resetEv, text, nil
 }
 
@@ -182,12 +188,26 @@ func HandleBackendFailure(ctx context.Context, deps RecoveryDeps, cause error) (
 		var client backend.Client
 		var resetEv session.PartialResetEvent
 		var text *string
-		if target.CompatibilityKey == deps.State.CompatibilityKey {
+		sameKey := target.CompatibilityKey == deps.State.CompatibilityKey
+		if sameKey {
 			client, resetEv, text, err = RecoverSameModel(ctx, deps, target)
 		} else {
 			client, resetEv, text, err = RecoverCrossModel(ctx, deps, target)
 		}
 		if err == nil {
+			// Counted HERE, not inside the two recovery functions, because
+			// this is the only place the key comparison is actually made.
+			// RecoverSameModel degrades by CALLING RecoverCrossModel when
+			// no usable checkpoint exists, so a counter incremented down
+			// there cannot tell "the replacement had a different key" from
+			// "the replacement had the same key but nothing to restore" —
+			// which is every same-model failover on the real fleet. See
+			// internal/metrics for the two axes.
+			if sameKey {
+				metrics.FailoverSameModelTotal.Add(1)
+			} else {
+				metrics.FailoverCrossModelTotal.Add(1)
+			}
 			target.BindSession()
 			deps.Router.Report(target.ID, true, 0)
 			return client, resetEv, text, nil

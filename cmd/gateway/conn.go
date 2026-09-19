@@ -574,7 +574,15 @@ func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, 
 	// rather than letting it read deps.State fields itself — reading
 	// those concurrently with a later write (e.g. a subsequent failover
 	// mutating Handle) would be a real data race.
-	go asyncCheckpoint(deps.Checkpoints, *client, deps.State.SessionID, deps.State.CompatibilityKey, deps.State.Handle)
+	// Don't ask a backend that has already said it cannot serialize. From
+	// M5 that is four of the fleet's six workers — sherpa-onnx and
+	// CTranslate2 expose no way to save inference state — so without this
+	// check the common case becomes one extra HTTP round trip per chunk
+	// whose only possible answer is 501. The error path below handles
+	// ErrNotSupported quietly and correctly; this just stops asking.
+	if w, ok := deps.Router.Find(deps.State.WorkerID); ok && w.Capabilities.Serializable {
+		go asyncCheckpoint(deps.Checkpoints, *client, deps.State.SessionID, deps.State.CompatibilityKey, deps.State.Handle)
+	}
 
 	if !trySend(ctx, events, deps.Emitter.Partial(resp.Text)) {
 		return false

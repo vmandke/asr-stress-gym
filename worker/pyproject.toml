@@ -4,12 +4,26 @@ version = "0.0.0"
 description = "ASR Stress Gym worker: adapter host over a fixed HTTP surface (open/push/flush/restore/close/health)."
 requires-python = ">=3.11"
 # M0 was stdlib-only (http.server). M1 adds fastapi/uvicorn for the real
-# open/push/flush/restore/close surface (docs/PROTOCOL.md). M5 adds one
-# dependency per adapter as it lands: numpy, sherpa-onnx,
-# faster-whisper / ctranslate2, onnxruntime.
+# open/push/flush/restore/close surface (docs/PROTOCOL.md). M5 adds the
+# real adapters' runtimes.
+#
+# One image hosts all five adapters (worker/Dockerfile), differentiated at
+# runtime by ADAPTER, so every runtime is installed everywhere even though
+# each container loads exactly one — see adapters/registry.py, whose
+# imports are lazy for precisely this reason.
+#
+# Versions are pinned, not floored: `runtime_version` is one of the seven
+# fields of the compatibility key (adapters/base.py), so an unpinned
+# upgrade would silently change the fleet's identity — two workers built a
+# week apart would stop being same-model, and the cheap failover path
+# would quietly disappear. A dependency bump here is a fleet change.
 dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    "numpy==2.4.6",
+    "sherpa-onnx==1.13.8",   # zipformer (transducer), conformer_ctc, whisper_onnx
+    "faster-whisper==1.2.1", # whisper_ct2; pulls ctranslate2
+    "ctranslate2==4.8.2",
 ]
 
 [project.optional-dependencies]

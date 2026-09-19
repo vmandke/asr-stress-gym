@@ -1,0 +1,29 @@
+# Every image in this stack builds from the repository root as its context
+# (deploy/gateway.Dockerfile, deploy/loadgen.Dockerfile, and — from M5 —
+# worker/Dockerfile, which needs models/fetch.sh).
+#
+# Without this file that context includes models/download (~365MB of
+# weights a developer fetched locally) and worker/.venv, which the daemon
+# would tar up and ship on every single build. The weights belong in the
+# image, but they get there by fetch.sh running INSIDE the build — never by
+# being copied in from a host directory that may hold a different, older,
+# or partial set than the one the image claims to have.
+.git/
+.gitignore
+
+models/download/
+models/.cache/
+
+worker/.venv/
+worker/.pytest_cache/
+**/__pycache__/
+*.egg-info/
+*.pyc
+
+/bin/
+*.test
+/results/
+
+.DS_Store
+.idea/
+.vscode/

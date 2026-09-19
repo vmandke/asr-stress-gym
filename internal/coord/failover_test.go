@@ -8,6 +8,7 @@ import (
 	"asr-stress-gym/internal/audio"
 	"asr-stress-gym/internal/backend"
 	"asr-stress-gym/internal/journal"
+	"asr-stress-gym/internal/metrics"
 	"asr-stress-gym/internal/router"
 	"asr-stress-gym/internal/session"
 	"asr-stress-gym/internal/wire"
@@ -409,4 +410,110 @@ func TestHandleBackendFailureReturnsNoCapacityWhenNoOtherWorkerExists(t *testing
 
 func fakeWorkerID(i int) string {
 	return "worker-bad-" + string(rune('a'+i))
+}
+
+// --- the two failover axes, counted separately ---
+
+// readCounters snapshots the process-lifetime metrics these tests assert
+// deltas on. The counters are package-level atomics shared by every test
+// in this binary, so an absolute value is meaningless here; only the
+// change across one call is.
+func readCounters() (sameModel, crossModel, restores, degraded int64) {
+	return metrics.FailoverSameModelTotal.Load(),
+		metrics.FailoverCrossModelTotal.Load(),
+		metrics.CheckpointRestoresTotal.Load(),
+		metrics.CheckpointDegradedTotal.Load()
+}
+
+// A same-key replacement that CANNOT restore a checkpoint is still a
+// same-model failover. It just recovers by replaying audio instead of by
+// restoring state.
+//
+// This is the case the whole real fleet lives in: worker-a and worker-b
+// run identical weights and advertise one compatibility key, and neither
+// can serialize inference state, because sherpa-onnx has no API for it.
+// Before M5 the only same-key pair in the fleet was two mock workers —
+// and mock IS serializable — so "same key" and "checkpoint restored" had
+// the same answer in every case that existed and the code conflated them:
+// the degrade path incremented failover_cross_model_total because it
+// reached that counter by CALLING RecoverCrossModel. Standing the real
+// adapters up made chaos scenario 2 fail with
+// failover_same_model_total 0 -> 0 on a failover between two workers
+// running the same model, which is how this was found.
+func TestSameKeyFailoverWithoutACheckpointStillCountsAsSameModel(t *testing.T) {
+	deps, _ := setup(t, "K1", 4, 10, nil) // nil store: nothing to restore, exactly like a non-serializable adapter
+	b := router.NewWorker("worker-b", newFakeBackend(), "K1", mockCaps())
+	deps.Router = router.New([]*router.Worker{b})
+
+	same0, cross0, restores0, degraded0 := readCounters()
+	if _, _, _, err := HandleBackendFailure(context.Background(), deps, errors.New("dead")); err != nil {
+		t.Fatalf("HandleBackendFailure: %v", err)
+	}
+	same1, cross1, restores1, degraded1 := readCounters()
+
+	if same1 != same0+1 {
+		t.Errorf("failover_same_model_total %d -> %d, want +1: the replacement shares the key", same0, same1)
+	}
+	if cross1 != cross0 {
+		t.Errorf("failover_cross_model_total %d -> %d, want unchanged: no key boundary was crossed", cross0, cross1)
+	}
+	if restores1 != restores0 {
+		t.Errorf("checkpoint_restores_total %d -> %d, want unchanged: there was no checkpoint to restore", restores0, restores1)
+	}
+	if degraded1 != degraded0+1 {
+		t.Errorf("checkpoint_degraded_total %d -> %d, want +1: the warm tier was attempted and fell through to replay", degraded0, degraded1)
+	}
+}
+
+// The counterpart: a same-key replacement WITH a valid checkpoint counts
+// on both axes — same-model, and the warm tier actually paid off. This is
+// what worker-mock does, and the only place in the fleet it happens.
+func TestSameKeyFailoverWithACheckpointCountsAsARestore(t *testing.T) {
+	store := NewCheckpointStore()
+	deps, _ := setup(t, "K1", 4, 10, store)
+	b := router.NewWorker("worker-b", newFakeBackend(), "K1", mockCaps())
+	deps.Router = router.New([]*router.Worker{b})
+
+	same0, _, restores0, degraded0 := readCounters()
+	if _, _, _, err := HandleBackendFailure(context.Background(), deps, errors.New("dead")); err != nil {
+		t.Fatalf("HandleBackendFailure: %v", err)
+	}
+	same1, _, restores1, degraded1 := readCounters()
+
+	if same1 != same0+1 {
+		t.Errorf("failover_same_model_total %d -> %d, want +1", same0, same1)
+	}
+	if restores1 != restores0+1 {
+		t.Errorf("checkpoint_restores_total %d -> %d, want +1: a valid checkpoint was restored", restores0, restores1)
+	}
+	if degraded1 != degraded0 {
+		t.Errorf("checkpoint_degraded_total %d -> %d, want unchanged", degraded0, degraded1)
+	}
+}
+
+// A different-key replacement is a cross-model failover and never touches
+// the warm tier at all — build-plan.md's rule that state from one model is
+// never deserialized into another.
+func TestDifferentKeyFailoverCountsAsCrossModelAndSkipsTheWarmTier(t *testing.T) {
+	store := NewCheckpointStore()
+	deps, _ := setup(t, "K1", 4, 10, store) // a checkpoint EXISTS; it must simply never be considered
+	c := router.NewWorker("worker-c", newFakeBackend(), "K2", mockCaps())
+	deps.Router = router.New([]*router.Worker{c})
+
+	same0, cross0, restores0, degraded0 := readCounters()
+	if _, _, _, err := HandleBackendFailure(context.Background(), deps, errors.New("dead")); err != nil {
+		t.Fatalf("HandleBackendFailure: %v", err)
+	}
+	same1, cross1, restores1, degraded1 := readCounters()
+
+	if cross1 != cross0+1 {
+		t.Errorf("failover_cross_model_total %d -> %d, want +1", cross0, cross1)
+	}
+	if same1 != same0 {
+		t.Errorf("failover_same_model_total %d -> %d, want unchanged", same0, same1)
+	}
+	if restores1 != restores0 || degraded1 != degraded0 {
+		t.Errorf("warm-tier counters moved (restores %d->%d, degraded %d->%d) — a cross-model failover must not even attempt a restore",
+			restores0, restores1, degraded0, degraded1)
+	}
 }

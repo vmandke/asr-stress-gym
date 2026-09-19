@@ -119,6 +119,8 @@ type metricsSnap struct {
 	FailoverSameModelTotal     int64 `json:"failover_same_model_total"`
 	FailoverCrossModelTotal    int64 `json:"failover_cross_model_total"`
 	FailoverExhaustedTotal     int64 `json:"failover_exhausted_total"`
+	CheckpointRestoresTotal    int64 `json:"checkpoint_restores_total"`
+	CheckpointDegradedTotal    int64 `json:"checkpoint_degraded_total"`
 }
 
 func fetchMetrics(gatewayURL string) (metricsSnap, error) {

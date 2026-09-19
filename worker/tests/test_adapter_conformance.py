@@ -1,73 +1,134 @@
 """Every adapter in the registry must pass this suite — written before the
-real adapters land (M5), per docs/implementation-plan.md "Adapter registry
-and conformance". Parametrized over the registry itself, so a new entry in
-adapters/registry.py is covered automatically with no edit here.
+real adapters landed (M5), per docs/implementation-plan.md "Adapter
+registry and conformance". Parametrized over the registry itself, so a new
+entry in adapters/registry.py is covered automatically with no edit here.
+
+The audio is a real corpus clip with a known transcript, not synthetic
+silence. That costs a couple of seconds per adapter and buys two things a
+zeros-buffer cannot: proof that the adapter's model actually runs and
+produces text, and a state-isolation check that means something (silence
+transcribes to "" on every real model, so "session 1's text differs from
+session 2's" would hold vacuously).
 
 Idempotent replay (pushing the same seq range twice is a no-op) is
-deliberately NOT tested here: that property is implemented in
-server.py's last_seq_applied check, not inside any individual adapter —
-see test_server.py::test_push_idempotent_replay.
+deliberately NOT tested here: that property is implemented in server.py's
+last_seq_applied check, not inside any individual adapter — see
+test_server.py::test_push_idempotent_replay.
 """
 
 from __future__ import annotations
 
+import wave
+from pathlib import Path
+
 import pytest
 
+from adapters import weights
 from adapters.base import NotSupported
-from adapters.registry import _REGISTRY, build
+from adapters.registry import _REGISTRY, NEEDS_WEIGHTS, build
 
 ADAPTER_NAMES = sorted(_REGISTRY.keys())
+CLIP = Path(__file__).resolve().parents[2] / "corpus" / "06_medium_sentence.wav"
+
+
+@pytest.fixture(scope="session")
+def speech() -> bytes:
+    """Raw s16le PCM from a committed corpus clip — the same opaque payload
+    shape a real push carries (docs/PROTOCOL.md)."""
+    with wave.open(str(CLIP)) as w:
+        assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16000, 1, 2)
+        return w.readframes(w.getnframes())
+
+
+@pytest.fixture(scope="module")
+def _built():
+    """One adapter instance per name for the whole module: constructing a
+    real adapter loads its weights (~0.3s, and 130MB for the CTC model), and
+    doing that once per test would dominate the suite's runtime for no
+    added coverage. Every test below treats its adapter as read-only apart
+    from the session states it creates, which is the isolation property
+    being tested anyway."""
+    return {}
+
+
+@pytest.fixture
+def adapter(request, _built):
+    name = request.getfixturevalue("name")
+    if name in NEEDS_WEIGHTS and not weights.available():
+        pytest.skip(f"{name}: no model weights on disk — run models/fetch.sh")
+    if name not in _built:
+        _built[name] = build(name)
+    return _built[name]
 
 
 @pytest.mark.parametrize("name", ADAPTER_NAMES)
 class TestAdapterConformance:
-    def test_compatibility_key_is_stable_across_calls(self, name):
-        a = build(name)
-        k1, k2 = a.compatibility_key(), a.compatibility_key()
+    def test_compatibility_key_is_stable_across_calls(self, adapter, name):
+        k1, k2 = adapter.compatibility_key(), adapter.compatibility_key()
         assert k1 == k2
         assert k1.hash() == k2.hash()
 
-    def test_state_is_isolated_between_sessions(self, name):
-        a = build(name)
-        s1 = a.create_state("session-1")
-        s2 = a.create_state("session-2")
+    def test_state_is_isolated_between_sessions(self, adapter, name, speech):
+        s1 = adapter.create_state("session-1")
+        s2 = adapter.create_state("session-2")
         assert s1 is not s2
 
-        silence = b"\x00\x00" * 320
-        _, s1_after = a.infer(silence, s1)
-        d1 = a.finalize(s1_after)
-        d2 = a.finalize(s2)  # must reflect s2's own (empty) history, not s1's
+        _, s1 = adapter.infer(speech, s1)
+        d1 = adapter.finalize(s1)
+        d2 = adapter.finalize(s2)  # must reflect s2's own (empty) history, not s1's
+
+        assert d1.text, "an adapter that saw a whole spoken sentence produced no text at all"
         assert d1.text != d2.text, "mutating one session's state affected another's"
 
-    def test_finalize_after_infer(self, name):
-        a = build(name)
-        st = a.create_state("s1")
-        silence = b"\x00\x00" * 320
-        _, st = a.infer(silence, st)
-        delta = a.finalize(st)
+    def test_finalize_after_infer(self, adapter, name, speech):
+        st = adapter.create_state("s1")
+        _, st = adapter.infer(speech, st)
+        delta = adapter.finalize(st)
         assert isinstance(delta.text, str)
 
-    def test_serializable_flag_is_honest(self, name):
+    def test_state_survives_a_second_utterance(self, adapter, name, speech):
+        """A session outlives an utterance (M2's utterance lifecycle), so
+        finalize must leave the state usable rather than spent. On the
+        streaming adapters this is load-bearing: sherpa-onnx's
+        input_finished() is terminal for a stream, so without
+        sherpa_online's roll-the-stream step the SECOND utterance of every
+        real session would fail while every mock test kept passing."""
+        st = adapter.create_state("s1")
+        _, st = adapter.infer(speech, st)
+        first = adapter.finalize(st)
+        _, st = adapter.infer(speech, st)
+        second = adapter.finalize(st)
+        assert first.text and second.text
+
+    def test_finalize_with_no_audio_is_safe(self, adapter, name):
+        """An utterance can end having buffered nothing (a session closed
+        during silence). This must return empty text, not raise and not
+        take the process down — sherpa-onnx's Whisper recognizer SIGSEGVs
+        on a zero-length buffer, which is why buffered.MIN_UTTERANCE_S
+        exists. A crash here kills the pytest process outright, so the
+        failure is unmissable."""
+        st = adapter.create_state("s1")
+        assert isinstance(adapter.finalize(st).text, str)
+
+    def test_serializable_flag_is_honest(self, adapter, name):
         """Capabilities.serializable must match what serialize/deserialize
-        actually do — a real adapter (M5) that declares False must raise
+        actually do — a real adapter that declares False must raise
         NotSupported, never silently no-op or fake a checkpoint."""
-        a = build(name)
-        caps = a.capabilities()
-        st = a.create_state("s1")
+        caps = adapter.capabilities()
+        st = adapter.create_state("s1")
 
         if caps.serializable:
-            blob = a.serialize(st)
+            blob = adapter.serialize(st)
             assert isinstance(blob, (bytes, bytearray))
-            assert a.deserialize(blob) is not None
+            assert adapter.deserialize(blob) is not None
         else:
             with pytest.raises(NotSupported):
-                a.serialize(st)
+                adapter.serialize(st)
             with pytest.raises(NotSupported):
-                a.deserialize(b"")
+                adapter.deserialize(b"")
 
-    def test_capabilities_are_well_formed(self, name):
-        a = build(name)
-        caps = a.capabilities()
+    def test_capabilities_are_well_formed(self, adapter, name):
+        caps = adapter.capabilities()
         assert caps.modes, "an adapter must declare at least one supported mode"
         assert caps.modes <= {"online", "offline"}
         assert caps.min_chunk_ms <= caps.max_chunk_ms
@@ -76,3 +137,26 @@ class TestAdapterConformance:
                 "a non-streaming adapter cannot serve online partials — "
                 "the router (M6) filters on exactly this"
             )
+
+
+@pytest.mark.skipif(not weights.available(), reason="no model weights on disk — run models/fetch.sh")
+def test_same_weights_under_different_runtimes_are_incompatible():
+    """The fleet's subtlest claim, asserted rather than described
+    (docs/implementation-plan.md, "What each pair demonstrates", row d->e):
+    worker-d and worker-e load the SAME weights and must still be
+    cache-incompatible, because the runtimes serialize state differently.
+
+    The assertion is specifically that they differ in `runtime` and in
+    nothing else that would explain the mismatch away — if these two keys
+    ever diverged on model_id or model_revision as well, the pair would
+    still 'pass' a hash comparison while no longer demonstrating anything.
+    """
+    d = build("whisper_ct2").compatibility_key()
+    e = build("whisper_onnx").compatibility_key()
+
+    assert d.model_family == e.model_family
+    assert d.model_id == e.model_id
+    assert d.model_revision == e.model_revision
+    assert d.dtype == e.dtype
+    assert d.runtime != e.runtime
+    assert d.hash() != e.hash()

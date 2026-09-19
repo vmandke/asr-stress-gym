@@ -215,3 +215,13 @@ worker never restores into itself.
 `open`/`push`/`flush`/`close`/`restore` are wired at M1-M3 against the
 mock adapter; `checkpoint` is wired at M3. All six are exercised by the
 fleet's mock deployments before any real model (M5) touches this surface.
+
+**From M5, `checkpoint` and `restore` answer `501 not_supported` on every
+real adapter**, and that is the expected steady state, not an outage.
+sherpa-onnx and CTranslate2 expose no way to serialize inference state, so
+only `worker-mock` advertises `serializable: true`. A gateway that sees
+501 here falls through to audio replay, which always works — the whole
+point of keeping the journal gateway-side. The 501 is therefore a *route
+selection* signal, not an error to retry: it says "this tier is
+unavailable on this backend," and the recovery path below it is
+unconditional. See [DECISIONS.md](DECISIONS.md), "Checkpoint tier".

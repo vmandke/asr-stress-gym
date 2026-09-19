@@ -58,8 +58,24 @@ func scenario2SameModelCrash(wsURL, gatewayURL, clipPath string, fleet map[strin
 		return fmt.Errorf("duplicate_finals_total changed (%d -> %d) — must stay zero", before.DuplicateFinalsTotal, after.DuplicateFinalsTotal)
 	}
 	if after.FailoverSameModelTotal <= before.FailoverSameModelTotal {
-		return fmt.Errorf("failover_same_model_total did not increase (%d -> %d) — this scenario specifically claims checkpoint-restored recovery, not just any recovery",
+		return fmt.Errorf("failover_same_model_total did not increase (%d -> %d) — this scenario claims recovery onto a CACHE-COMPATIBLE worker, not just any recovery",
 			before.FailoverSameModelTotal, after.FailoverSameModelTotal)
+	}
+
+	// The warm-checkpoint tier is the second, independent axis: having
+	// chosen a compatible worker, did the checkpoint actually get
+	// restored, or did it degrade to audio replay? Exactly one must have
+	// happened — asserting the SUM rather than either one keeps this
+	// scenario adapter-independent. With ADAPTER=mock it restores; with
+	// ADAPTER=zipformer it degrades, because sherpa-onnx cannot serialize
+	// inference state. Both are correct outcomes; what would be a bug is
+	// neither counter moving, which would mean the cheap path was never
+	// even attempted on a worker that shares the key.
+	warmBefore := before.CheckpointRestoresTotal + before.CheckpointDegradedTotal
+	warmAfter := after.CheckpointRestoresTotal + after.CheckpointDegradedTotal
+	if warmAfter <= warmBefore {
+		return fmt.Errorf("neither checkpoint_restores_total nor checkpoint_degraded_total moved (%d -> %d) — a same-model failover must at least ATTEMPT the warm tier",
+			warmBefore, warmAfter)
 	}
 
 	final, err := s.end(ctx, seq)
@@ -155,7 +171,13 @@ func scenario5CorruptCheckpoint(wsURL, gatewayURL, clipPath string, fleet map[st
 	if err != nil {
 		return err
 	}
-	s, err := openSession(ctx, wsURL)
+	// Checkpoint corruption is meaningful only on the one adapter that can
+	// actually serialize a checkpoint. Before M5 every worker was mock, so
+	// an unpinned session happened to satisfy that precondition; on the real
+	// heterogeneous fleet it made this scenario a coin flip between mock and
+	// a permanent 501 from a real adapter. Pin deliberately to the warm tier
+	// the scenario is testing.
+	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-mock"])
 	if err != nil {
 		return err
 	}
@@ -166,11 +188,6 @@ func scenario5CorruptCheckpoint(wsURL, gatewayURL, clipPath string, fleet map[st
 		return fmt.Errorf("first half: %w", err)
 	}
 	time.Sleep(checkpointSettleDelay)
-
-	pinned, err := findPinnedWorker(fleet["worker-mock"], fleet["worker-a"], fleet["worker-b"], fleet["worker-c"], fleet["worker-d"])
-	if err != nil {
-		return fmt.Errorf("could not determine the pinned worker: %w", err)
-	}
 
 	corrupted, err := corruptCheckpoint(gatewayURL, s.sessionID)
 	if err != nil {
@@ -204,13 +221,19 @@ func scenario5CorruptCheckpoint(wsURL, gatewayURL, clipPath string, fleet map[st
 	if after.DuplicateFinalsTotal != before.DuplicateFinalsTotal {
 		return fmt.Errorf("duplicate_finals_total changed (%d -> %d) — must stay zero", before.DuplicateFinalsTotal, after.DuplicateFinalsTotal)
 	}
-	if after.FailoverSameModelTotal != before.FailoverSameModelTotal {
-		return fmt.Errorf("failover_same_model_total increased (%d -> %d) — a CORRUPTED checkpoint must never be restored from",
-			before.FailoverSameModelTotal, after.FailoverSameModelTotal)
+	// This scenario's claim is about the CHECKPOINT, not about which
+	// worker was chosen — the session opens unpinned, so the replacement
+	// may legitimately share the dead worker's key or not, and asserting
+	// on same/cross would be asserting on a coin flip. What must hold
+	// unconditionally is invariant 8: a corrupted blob is never restored
+	// from, and the session survives anyway on audio replay.
+	if after.CheckpointRestoresTotal != before.CheckpointRestoresTotal {
+		return fmt.Errorf("checkpoint_restores_total increased (%d -> %d) — a CORRUPTED checkpoint must never be restored from",
+			before.CheckpointRestoresTotal, after.CheckpointRestoresTotal)
 	}
-	if after.FailoverCrossModelTotal <= before.FailoverCrossModelTotal {
-		return fmt.Errorf("failover_cross_model_total did not increase (%d -> %d) — the corrupted checkpoint must fall back to audio replay",
-			before.FailoverCrossModelTotal, after.FailoverCrossModelTotal)
+	if after.FailoverTotal <= before.FailoverTotal {
+		return fmt.Errorf("failover_total did not increase (%d -> %d) — the session must have recovered, via audio replay, despite the corrupted checkpoint",
+			before.FailoverTotal, after.FailoverTotal)
 	}
 
 	final, err := s.end(ctx, seq)

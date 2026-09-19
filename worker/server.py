@@ -22,10 +22,13 @@ import base64
 import os
 import random
 import time
+from collections import deque
+from statistics import median
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from adapters import pcm
 from adapters.base import NotSupported
 from adapters.registry import build as build_adapter
 from state import HandleNotFound, StaleGeneration, StateStore
@@ -43,6 +46,27 @@ PORT = int(os.environ.get("HEALTH_PORT", "9000"))
 adapter = build_adapter(ADAPTER_NAME, model_id=None if MODEL == "unset" else MODEL)
 store = StateStore()
 STARTED_AT = time.time()
+
+# Rolling RTF window (inference wall-seconds / audio-seconds), reported at
+# /health as rtf_p50. Bounded like the router's own health windows
+# (internal/router: windowSize=50) so a long-lived worker cannot grow it
+# without limit. Real numbers from M5 onward — before the real adapters
+# landed this was hardcoded None, which would have made the per-adapter RTF
+# table in docs/RTF.md a fiction.
+_RTF_WINDOW = 64
+_rtf_samples: deque[float] = deque(maxlen=_RTF_WINDOW)
+
+
+def _record_rtf(audio: bytes, elapsed_s: float) -> None:
+    seconds = pcm.duration_s(audio)
+    if seconds > 0:
+        _rtf_samples.append(elapsed_s / seconds)
+
+
+def _rtf_p50() -> float | None:
+    if not _rtf_samples:
+        return None
+    return round(median(_rtf_samples), 4)
 
 app = FastAPI()
 
@@ -62,9 +86,14 @@ def health() -> dict:
         "compatibility_key_hash": adapter.compatibility_key().hash(),
         "capabilities": adapter.capabilities().to_json(),
         "active_sessions": store.count(),
-        "state_bytes": 0,  # real accounting lands with the real adapters (M5)
+        # Still 0, and deliberately not invented at M5: a real adapter's
+        # state is an onnxruntime-owned C++ object
+        # (sherpa_onnx.OnlineStream) whose footprint Python cannot measure
+        # without guessing, and a guessed number feeding the router's
+        # memory-headroom filter (M7) would be worse than an honest zero.
+        "state_bytes": 0,
         "queue_depth": 0,
-        "rtf_p50": None,
+        "rtf_p50": _rtf_p50(),
         "last_heartbeat_ms": int(time.time() * 1000),
     }
 
@@ -112,7 +141,19 @@ async def stream_push(request: Request):
             "generation": rec.generation,
         }
 
-    delta, next_state = adapter.infer(audio, rec.model_state)
+    # Off the event loop. With the mock adapter this was merely tidy; with
+    # the real ones it is required. sherpa-onnx and ctranslate2 both block
+    # in C++ for the whole inference, so calling infer() inline would stall
+    # every other session's HTTP handler in this process for the duration
+    # — turning a concurrency measurement (M8) into a measurement of how
+    # long one decode takes, serialized. Each session owns its own stream,
+    # so distinct sessions decoding at once is the adapters' intended
+    # usage; the two non-streaming ones additionally serialize themselves
+    # (adapters/buffered.py).
+    started = time.perf_counter()
+    delta, next_state = await asyncio.to_thread(adapter.infer, audio, rec.model_state)
+    _record_rtf(audio, time.perf_counter() - started)
+
     try:
         rec = store.compare_and_commit(
             handle,
@@ -134,7 +175,10 @@ async def stream_flush(request: Request) -> dict:
         rec = store.get(body["handle"])
     except HandleNotFound:
         raise HTTPException(status_code=404, detail="unknown handle") from None
-    delta = adapter.finalize(rec.model_state)
+    # Off the event loop for the same reason as push, and more so: on the
+    # non-streaming adapters finalize IS the inference (adapters/buffered.py),
+    # so this is the single most expensive call the worker makes.
+    delta = await asyncio.to_thread(adapter.finalize, rec.model_state)
     return {"text": delta.text, "final": True}
 
 

@@ -15,6 +15,40 @@ each.
 | VAD | Library-backed, behind `audio.VAD`, one implementation swappable for another. Thresholds are config; the values chosen are reported in the README, not defended as correct. |
 | Gateway↔worker transport | HTTP/1.1 keep-alive, binary body for audio, JSON for control/response. |
 | Bifrost | Finals and offline jobs only, behind `BIFROST_ENABLED`, with a direct-to-worker fallback always present. First thing cut if the schedule slips (see implementation-plan.md "Risks and the cut line"). |
+| Model weights | Fetched by `models/fetch.sh` at **image build time only**, baked into the worker image, never downloaded when a container starts. One image hosts all five adapters, so the ~365MB of weights is a single shared layer rather than five copies. |
+| Runtime versions | **Pinned exactly** in `worker/pyproject.toml`, not floored. `runtime_version` is one of the seven fields of the compatibility key, so an unpinned upgrade would silently change the fleet's identity — two workers built a week apart would stop being same-model and the cheap failover path would quietly disappear. A dependency bump is a fleet change. |
+| What "same model" means | Two workers are same-model because they run the same `ADAPTER` against the same baked weights — a fact about the image — not because they share a `MODEL` label. `MODEL` is display-only from M5 onward. |
+
+## M5 deviations from the planned fleet
+
+Recorded here rather than silently absorbed, because
+[implementation-plan.md](implementation-plan.md)'s fleet table names
+specific checkpoints and two of them did not survive contact.
+
+| Planned | Built | Why |
+|---|---|---|
+| `worker-c`: `zipformer-ctc-en` (sherpa-onnx) | NVIDIA fast-conformer CTC, English, 480ms, int8 (`conformer_ctc`) | No English streaming zipformer-CTC export is published — the upstream streaming zipformer-CTC models are Chinese. Pointing an English corpus at a Chinese model would make every transcript assertion in the suite meaningless. The role the plan actually needed was *a streaming backend of a different family, with a different state shape and a different key*, and this fills it exactly. |
+| `worker-e`: whisper-tiny.en under raw `onnxruntime` | whisper-tiny.en under ONNX Runtime **via sherpa-onnx's** offline Whisper recognizer (`whisper_onnx`) | Same runtime underneath, minus a hand-written mel/beam-search implementation that would have been this project's largest piece of un-graded code. The d↔e claim — same weights, different runtime, therefore cache-incompatible — is unaffected and is asserted directly by `test_same_weights_under_different_runtimes_are_incompatible`. |
+
+## Findings from building against the real models
+
+Both were found by running the models, not by reading about them, and
+both are the kind of thing that would otherwise surface much later
+wearing a disguise.
+
+- **sherpa-onnx's Whisper recognizer SIGSEGVs on a zero-length buffer** —
+  it takes the whole worker process down with no Python exception. An
+  utterance that ends having buffered nothing is entirely ordinary (a
+  session closed during silence), and without a guard it would look
+  identical to a crashed worker: exactly the signal chaos testing depends
+  on being real. `adapters/buffered.py`'s `MIN_UTTERANCE_S` guard exists
+  for this and is covered by `test_finalize_with_no_audio_is_safe`.
+- **A streaming encoder needs tail padding before `input_finished()`** or
+  the final is truncated — `"...near the river"` instead of
+  `"...near the river bank"` on zipformer, and `"...lazy dog ne"` on the
+  CTC model. 0.6s of trailing silence recovers the full text on both; 0.3s
+  recovers only part of it. Measured on `corpus/06_medium_sentence.wav`,
+  and reported rather than defended (`sherpa_online.TAIL_PADDING_S`).
 
 ## Why these are decisions, not defaults
 
