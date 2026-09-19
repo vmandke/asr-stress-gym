@@ -31,10 +31,14 @@ type CacheCompatibilityKey string
 // contracts: this is what defect #1 (three conflicting backend
 // interfaces) collapses down to on the gateway side.
 type InferenceState struct {
-	SessionID    string
-	UtteranceID  uint64
-	Mode         Mode
-	SampleRateHz int // set once from session.start, alongside Mode — needed again at M3 to re-Open against a replacement worker on failover
+	SessionID   string
+	UtteranceID uint64
+	// UtteranceStartSeq is the sequence at which VAD confirmed the current
+	// utterance. It is set at M4's speech.start and used for the auto-final
+	// range; a client-ended, never-voiced session retains the zero default.
+	UtteranceStartSeq uint64
+	Mode              Mode
+	SampleRateHz      int // set once from session.start, alongside Mode — needed again at M3 to re-Open against a replacement worker on failover
 
 	// ownership
 	WorkerID         string
@@ -82,6 +86,7 @@ func NewInferenceState(sessionID string, mode Mode) *InferenceState {
 // M4 lands — see internal/session/events_test.go.
 func (s *InferenceState) NewUtterance() {
 	s.UtteranceID++
+	s.UtteranceStartSeq = 0
 	s.PartialRevision = 0
 	s.LastPartial = ""
 	s.Finalized = false

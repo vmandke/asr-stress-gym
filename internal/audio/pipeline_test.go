@@ -2,6 +2,8 @@ package audio
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"asr-stress-gym/internal/wire"
@@ -12,6 +14,35 @@ const sampleRateHz = 16000
 func pcmOfDuration(ms float64) []byte {
 	numSamples := int(ms * sampleRateHz / 1000)
 	return make([]byte, numSamples*wire.BytesPerSample)
+}
+
+type scriptedVAD struct {
+	decisions []bool
+	calls     int
+}
+
+func (v *scriptedVAD) Speech(samples []int16) (bool, error) {
+	if len(v.decisions) == 0 {
+		return false, fmt.Errorf("unexpected VAD call %d", v.calls)
+	}
+	decision := v.decisions[0]
+	v.decisions = v.decisions[1:]
+	v.calls++
+	return decision, nil
+}
+
+func vadTestPipeline(decisions ...bool) *vadPipeline {
+	return newVADPipeline(sampleRateHz, 100, VADConfig{
+		WindowMs: 20, StartSpeechMs: 40, EndSilenceMs: 60, PreRollMs: 80,
+	}, &scriptedVAD{decisions: decisions})
+}
+
+func pcmFrame(seq uint64, ms float64, sample int16) wire.Frame {
+	f := audioFrame(seq, ms)
+	for i := 0; i < len(f.Payload); i += wire.BytesPerSample {
+		binary.LittleEndian.PutUint16(f.Payload[i:], uint16(sample))
+	}
+	return f
 }
 
 func audioFrame(seq uint64, ms float64) wire.Frame {
@@ -197,5 +228,124 @@ func TestSilenceNeverEntersChunkContent(t *testing.T) {
 	}
 	if acc.hasPending {
 		t.Fatal("silent record left state in the accumulator")
+	}
+}
+
+func TestVADSilenceProducesNoChunksOverOneMinute(t *testing.T) {
+	p, err := NewVADPipeline(sampleRateHz, 160, DefaultVADConfig)
+	if err != nil {
+		t.Fatalf("NewVADPipeline: %v", err)
+	}
+	for seq := uint64(0); seq < 3000; seq++ { // 3000 * 20ms = 60s
+		ref, err := p.Ingest(audioFrame(seq, 20))
+		if err != nil {
+			t.Fatalf("Ingest(%d): %v", seq, err)
+		}
+		if ref.Voiced {
+			t.Fatalf("silence at seq %d was classified voiced", seq)
+		}
+		if got := p.Ready(); len(got) != 0 {
+			t.Fatalf("silence produced %d backend chunk(s) at seq %d", len(got), seq)
+		}
+	}
+	if _, ok := p.Boundary(); ok {
+		t.Fatal("silence produced a speech/endpoint boundary")
+	}
+}
+
+func TestVADHysteresisRetainsPreRollAtSpeechOnset(t *testing.T) {
+	// Two silent windows, then two voiced windows. The 40ms start threshold
+	// means speech.start fires only at seq 3, but the 80ms pre-roll makes the
+	// pending chunk begin at seq 0 instead of clipping the onset.
+	p := vadTestPipeline(false, false, true, true)
+	for seq := uint64(0); seq < 4; seq++ {
+		if _, err := p.Ingest(pcmFrame(seq, 20, 1000)); err != nil {
+			t.Fatalf("Ingest(%d): %v", seq, err)
+		}
+	}
+	ev, ok := p.Boundary()
+	if !ok || ev.Type != EventSpeechStart || ev.Seq != 3 {
+		t.Fatalf("boundary = %+v, ok=%v; want speech.start at seq 3", ev, ok)
+	}
+	flushed := p.Flush()
+	if len(flushed) != 1 {
+		t.Fatalf("Flush produced %d chunks, want 1", len(flushed))
+	}
+	if flushed[0].SeqStart != 0 || flushed[0].SeqEnd != 3 {
+		t.Fatalf("pre-roll chunk span = [%d,%d], want [0,3]", flushed[0].SeqStart, flushed[0].SeqEnd)
+	}
+}
+
+func TestVADEndpointUsesSilenceHysteresis(t *testing.T) {
+	p := vadTestPipeline(true, true, false, false, false)
+	for seq := uint64(0); seq < 5; seq++ {
+		if _, err := p.Ingest(pcmFrame(seq, 20, 1200)); err != nil {
+			t.Fatalf("Ingest(%d): %v", seq, err)
+		}
+	}
+	start, ok := p.Boundary()
+	if !ok || start.Type != EventSpeechStart || start.Seq != 1 {
+		t.Fatalf("first boundary = %+v, ok=%v; want speech.start at seq 1", start, ok)
+	}
+	endpoint, ok := p.Boundary()
+	if !ok || endpoint.Type != EventEndpoint || endpoint.Seq != 4 {
+		t.Fatalf("second boundary = %+v, ok=%v; want endpoint at seq 4", endpoint, ok)
+	}
+}
+
+func TestVADReframesBatchedTransportAudio(t *testing.T) {
+	detector := &scriptedVAD{decisions: []bool{false, true}}
+	p := newVADPipeline(sampleRateHz, 100, VADConfig{
+		WindowMs: 20, StartSpeechMs: 20, EndSilenceMs: 60, PreRollMs: 40,
+	}, detector)
+	if _, err := p.Ingest(pcmFrame(7, 40, 1200)); err != nil {
+		t.Fatalf("Ingest batched frame: %v", err)
+	}
+	if detector.calls != 2 {
+		t.Fatalf("VAD calls = %d, want 2 20ms windows from one 40ms transport frame", detector.calls)
+	}
+	if ev, ok := p.Boundary(); !ok || ev.Type != EventSpeechStart || ev.Seq != 7 {
+		t.Fatalf("boundary = %+v, ok=%v; want speech.start at seq 7", ev, ok)
+	}
+}
+
+func TestVADRecutReproducesPreRollDispatch(t *testing.T) {
+	p := vadTestPipeline(false, false, true, true)
+	p.live.chunkMs = 60
+	var records []Record
+	var live []Chunk
+	for seq := uint64(0); seq < 4; seq++ {
+		f := pcmFrame(seq, 20, 1000)
+		ref, err := p.Ingest(f)
+		if err != nil {
+			t.Fatalf("Ingest(%d): %v", seq, err)
+		}
+		records = append(records, Record{Seq: seq, DurationMs: ref.DurationMs, Voiced: ref.Voiced, Payload: f.Payload})
+		live = append(live, p.Ready()...)
+	}
+	replayed, err := p.Recut(records)
+	if err != nil {
+		t.Fatalf("Recut: %v", err)
+	}
+	if len(replayed) != len(live) {
+		t.Fatalf("Recut emitted %d chunks, live emitted %d", len(replayed), len(live))
+	}
+	for i := range live {
+		if replayed[i].SeqStart != live[i].SeqStart || replayed[i].SeqEnd != live[i].SeqEnd {
+			t.Fatalf("chunk %d span replayed=[%d,%d], live=[%d,%d]", i,
+				replayed[i].SeqStart, replayed[i].SeqEnd, live[i].SeqStart, live[i].SeqEnd)
+		}
+		if !bytes.Equal(replayed[i].Bytes, live[i].Bytes) {
+			t.Fatalf("chunk %d bytes differ between replay and live pre-roll dispatch", i)
+		}
+	}
+}
+
+func TestVADConfigRejectsUnsupportedWindow(t *testing.T) {
+	_, err := NewVADPipeline(sampleRateHz, 160, VADConfig{
+		WindowMs: 15, StartSpeechMs: 40, EndSilenceMs: 600, PreRollMs: 160,
+	})
+	if err == nil {
+		t.Fatal("expected unsupported 15ms WebRTC VAD window to be rejected")
 	}
 }

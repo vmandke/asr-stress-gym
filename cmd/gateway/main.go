@@ -16,6 +16,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"asr-stress-gym/internal/audio"
 	"asr-stress-gym/internal/backend"
 	"asr-stress-gym/internal/coord"
 	"asr-stress-gym/internal/metrics"
@@ -151,7 +152,13 @@ func main() {
 		log.Printf("gateway: WARNING — no workers answered at startup; every session will fail until one becomes reachable")
 	}
 	checkpoints := coord.NewCheckpointStore()
-	cfg := connConfig{Router: rt, Checkpoints: checkpoints}
+	cfg := connConfig{
+		Router:      rt,
+		Checkpoints: checkpoints,
+		NewAudioPipeline: func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error) {
+			return audio.NewVADPipeline(sampleRateHz, chunkMs, audio.DefaultVADConfig)
+		},
+	}
 
 	dashMux := http.NewServeMux()
 	dashMux.HandleFunc("GET /health", healthHandler)

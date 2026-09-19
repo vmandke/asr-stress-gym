@@ -12,6 +12,13 @@ type AckEvent struct {
 	HighestContiguousSeq uint64 `json:"highest_contiguous_seq"`
 }
 
+type SpeechStartEvent struct {
+	Type        string `json:"type"` // "speech.start"
+	SessionID   string `json:"session_id"`
+	UtteranceID string `json:"utterance_id"`
+	SeqStart    uint64 `json:"seq_start"`
+}
+
 type PartialEvent struct {
 	Type          string `json:"type"` // "partial"
 	SessionID     string `json:"session_id"`
@@ -99,6 +106,17 @@ func (e *Emitter) Ack(highestContiguousSeq uint64) AckEvent {
 		Type:                 "ack",
 		SessionID:            e.state.SessionID,
 		HighestContiguousSeq: highestContiguousSeq,
+	}
+}
+
+func (e *Emitter) SpeechStart(seqStart uint64) SpeechStartEvent {
+	e.mustNotBeFinalized("speech.start")
+	e.state.UtteranceStartSeq = seqStart
+	return SpeechStartEvent{
+		Type:        "speech.start",
+		SessionID:   e.state.SessionID,
+		UtteranceID: e.state.UtteranceLabel(),
+		SeqStart:    seqStart,
 	}
 }
 

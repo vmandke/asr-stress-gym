@@ -58,8 +58,9 @@ const (
 // library inside the gateway process, not a service, and every
 // connection's sessionLoop calls Pick/Report on the SAME instance.
 type connConfig struct {
-	Router      *router.Router
-	Checkpoints *coord.CheckpointStore
+	Router           *router.Router
+	Checkpoints      *coord.CheckpointStore
+	NewAudioPipeline func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error)
 }
 
 func newSessionID() string {
@@ -304,7 +305,21 @@ func handleControl(
 		mode := session.Mode(m.Mode)
 		state.Mode = mode
 		state.SampleRateHz = m.SampleRateHz // needed again if a failover ever has to re-Open against a replacement
-		deps.Pipeline = audio.NewPassthroughPipeline(uint32(m.SampleRateHz), chunkMsFor(mode))
+		newPipeline := cfg.NewAudioPipeline
+		if newPipeline == nil {
+			// Tests exercising gateway/router mechanics deliberately retain the
+			// M1 pass-through implementation. M4's VAD contract is tested in
+			// internal/audio, so those tests need not learn audio policy.
+			newPipeline = func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error) {
+				return audio.NewPassthroughPipeline(sampleRateHz, chunkMs), nil
+			}
+		}
+		pipeline, err := newPipeline(uint32(m.SampleRateHz), chunkMsFor(mode))
+		if err != nil {
+			trySend(ctx, events, emitter.Error(fmt.Sprintf("audio pipeline setup failed: %v", err)))
+			return false
+		}
+		deps.Pipeline = pipeline
 
 		target, resp, err := openWithRetry(ctx, cfg.Router, state.SessionID, mode, m)
 		if err != nil {
@@ -409,11 +424,91 @@ func handleAudioFrame(ctx context.Context, f wire.Frame, deps coord.RecoveryDeps
 	// complete replay mechanism with no separate dispatch-log structure.
 	deps.Journal.Append(audio.Record{Seq: f.Seq, DurationMs: ref.DurationMs, Voiced: ref.Voiced, Payload: f.Payload})
 
+	var endpoint bool
+	for {
+		ev, ok := deps.Pipeline.Boundary()
+		if !ok {
+			break
+		}
+		switch ev.Type {
+		case audio.EventSpeechStart:
+			if !trySend(ctx, events, deps.Emitter.SpeechStart(ev.Seq)) {
+				return false
+			}
+		case audio.EventEndpoint:
+			endpoint = true
+		}
+	}
+
 	for _, c := range deps.Pipeline.Ready() {
 		if !dispatchChunk(ctx, c, deps, client, events) {
 			return false
 		}
 	}
+	if endpoint {
+		return finalizeEndpoint(ctx, deps, client, events)
+	}
+	return true
+}
+
+// finalizeEndpoint ends the current VAD-delimited utterance but keeps the
+// WebSocket session open. The worker handle is deliberately replaced: workers
+// expose a stateful streaming API, so continuing to Push after Flush would
+// make a new utterance inherit the old model state and transcript.
+func finalizeEndpoint(ctx context.Context, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
+	for _, c := range deps.Pipeline.Flush() {
+		if !dispatchChunk(ctx, c, deps, client, events) {
+			return false
+		}
+	}
+	flushResp, err := (*client).Flush(ctx, deps.State.Handle)
+	if err != nil {
+		trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("backend flush after endpoint failed: %v", err)))
+		return false
+	}
+	finalEv, isNew := deps.Emitter.Final(flushResp.Text, deps.State.UtteranceStartSeq, deps.State.LastAppliedSeq)
+	if isNew {
+		trimSeq := finalEv.SeqEnd
+		shouldTrim := true
+		if start, ok := deps.Pipeline.RetentionStart(); ok {
+			// TrimBefore excludes its argument too, so retain the pre-roll's
+			// first record by placing the floor immediately before it.
+			if start == 0 {
+				// There is no representable sequence before zero. Leaving the
+				// journal intact is the safe bounded exception for this first
+				// utterance; its ring capacity remains the memory backstop.
+				shouldTrim = false
+			} else if start-1 < trimSeq {
+				trimSeq = start - 1
+			}
+		}
+		if shouldTrim {
+			deps.Journal.TrimBefore(trimSeq)
+		}
+	} else {
+		metrics.DuplicateFinalsTotal.Add(1)
+	}
+	if !trySend(ctx, events, finalEv) {
+		return false
+	}
+
+	oldHandle := deps.State.Handle
+	if err := (*client).Close(ctx, oldHandle); err != nil {
+		trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("backend close after endpoint failed: %v", err)))
+		return false
+	}
+	resp, err := (*client).Open(ctx, backend.OpenReq{
+		SessionID: deps.State.SessionID, SampleRateHz: deps.State.SampleRateHz, Mode: string(deps.State.Mode),
+	})
+	if err != nil {
+		trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("backend open next utterance failed: %v", err)))
+		return false
+	}
+	deps.Checkpoints.Delete(deps.State.SessionID)
+	deps.State.Handle = resp.Handle
+	deps.State.Generation = resp.Generation
+	deps.State.LastAppliedSeq = finalEv.SeqEnd
+	deps.State.NewUtterance()
 	return true
 }
 

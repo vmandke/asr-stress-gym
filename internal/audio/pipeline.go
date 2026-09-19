@@ -86,6 +86,12 @@ type Pipeline interface {
 	// true.
 	Boundary() (Event, bool)
 
+	// RetentionStart reports the oldest sequence that must remain in the
+	// journal for a possible next utterance's pre-roll. A pipeline with no
+	// retained pre-roll returns ok=false. This keeps journal trimming safe
+	// without exposing sample data above internal/audio.
+	RetentionStart() (seq uint64, ok bool)
+
 	// Recut reproduces, from a stored sequence of Records, the same
 	// chunk boundaries live Ingest would have cut. Used by replay (M2/M3)
 	// so recovery calls a backend with byte-identical chunk cuts to what
@@ -196,6 +202,8 @@ func (p *passthroughPipeline) Ready() []Chunk {
 func (p *passthroughPipeline) Boundary() (Event, bool) {
 	return Event{}, false
 }
+
+func (p *passthroughPipeline) RetentionStart() (uint64, bool) { return 0, false }
 
 func (p *passthroughPipeline) Flush() []Chunk {
 	return p.live.forceCut()
