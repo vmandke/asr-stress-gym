@@ -19,14 +19,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 import random
 import time
+import uuid
+import wave
 from collections import deque
 from statistics import median
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from adapters import pcm
 from adapters.base import NotSupported
@@ -180,6 +183,78 @@ async def stream_flush(request: Request) -> dict:
     # so this is the single most expensive call the worker makes.
     delta = await asyncio.to_thread(adapter.finalize, rec.model_state)
     return {"text": delta.text, "final": True}
+
+
+# --- OpenAI-compatible transcription (the Bifrost boundary, M7) ---
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    file: UploadFile = File(...),
+    model: str = Form(default=""),
+    response_format: str = Form(default="json"),
+):
+    """OpenAI's transcription shape, so Bifrost can route to this worker as
+    an ordinary provider (docs/build-plan.md, "The Bifrost boundary").
+
+    **Stateless by construction, and that is the whole point.** Every other
+    endpoint on this worker is part of a stateful session: `push` carries a
+    handle and an expected generation, and the worker holds inference state
+    keyed by that handle. Bifrost load-balances and fails over between
+    providers, so a stateful call routed through it could land chunk N on
+    one worker and chunk N+1 on another — the second holding no state, and
+    the gateway never learning the model changed underneath it. That is
+    precisely the silent corruption this project exists to prevent, which
+    is why only complete-utterance requests come through here.
+
+    So this creates fresh state, runs the whole buffer through it, finalizes
+    and throws the state away. Nothing survives the request. Every adapter
+    supports it, including the non-streaming ones — for those, `finalize`
+    IS the inference (adapters/buffered.py).
+    """
+    raw = await file.read()
+    try:
+        pcm_bytes = _to_pcm(raw)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+    def run() -> str:
+        st = adapter.create_state(f"oai-{uuid.uuid4().hex[:8]}")
+        _, st = adapter.infer(pcm_bytes, st)
+        return adapter.finalize(st).text
+
+    started = time.perf_counter()
+    text = await asyncio.to_thread(run)
+    _record_rtf(pcm_bytes, time.perf_counter() - started)
+
+    if response_format == "text":
+        return PlainTextResponse(text)
+    # OpenAI returns {"text": ...}; the extra fields are additive and let a
+    # caller see WHICH backend answered, which matters when Bifrost is the
+    # thing that chose it.
+    return {"text": text, "model": model or MODEL, "worker_id": WORKER_ID}
+
+
+def _to_pcm(raw: bytes) -> bytes:
+    """Accept either a WAV file or bare s16le PCM.
+
+    A WAV header must be stripped rather than fed through: adapters treat
+    their input as raw samples (adapters/pcm.py), so 44 bytes of "RIFF...."
+    would be decoded as ~22 samples of noise at the head of every
+    utterance. Clients posting to an OpenAI-shaped endpoint send a
+    container, so this is the common case, not the edge one.
+    """
+    if raw[:4] == b"RIFF":
+        with wave.open(io.BytesIO(raw)) as w:
+            if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (16000, 1, 2):
+                raise ValueError(
+                    f"expected mono 16kHz s16le (docs/FAQ.md), got "
+                    f"{w.getframerate()}Hz {w.getnchannels()}ch {w.getsampwidth() * 8}bit"
+                )
+            return w.readframes(w.getnframes())
+    if len(raw) % 2 != 0:
+        raise ValueError("bare PCM payload has an odd byte count; s16le needs 2 bytes per sample")
+    return raw
 
 
 @app.post("/v1/stream/restore")

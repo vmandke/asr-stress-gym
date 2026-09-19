@@ -1,6 +1,9 @@
 package session
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Transcript event JSON shapes — docs/PROTOCOL.md, "Gateway -> Client".
 // Struct tags match the wire shape exactly so these can be marshaled
@@ -61,6 +64,24 @@ type ErrorEvent struct {
 	Type      string `json:"type"` // "error"
 	SessionID string `json:"session_id"`
 	Reason    string `json:"reason"`
+}
+
+// OverloadedEvent is admission refusal: the session was never created, and
+// the client may retry. Distinct from ErrorEvent, which is terminal.
+//
+// The distinction is the whole of build-plan.md's degradation step 4:
+// "reject NEW sessions with `overloaded` (retryable)", ordered ahead of
+// step 5, "never drop an already-admitted session". A client that cannot
+// tell refusal from failure cannot honour that ordering — it either
+// retries a terminal error forever or gives up on a retryable one.
+//
+// RetryAfterMs is advisory. It is the gateway's estimate of when capacity
+// might exist, not a promise.
+type OverloadedEvent struct {
+	Type         string `json:"type"` // "overloaded"
+	SessionID    string `json:"session_id"`
+	Reason       string `json:"reason"`
+	RetryAfterMs int64  `json:"retry_after_ms"`
 }
 
 // Emitter is the ONLY place transcript-emission invariants are enforced
@@ -183,6 +204,18 @@ func (e *Emitter) Discontinuity(r DiscontinuityRange) DiscontinuityEvent {
 		SessionID: e.state.SessionID,
 		SeqStart:  r.SeqStart,
 		SeqEnd:    r.SeqEnd,
+	}
+}
+
+// Overloaded reports admission refusal. Deliberately NOT subject to
+// mustNotBeFinalized: this event describes a session that was never
+// admitted, so there is no utterance it could follow a final of.
+func (e *Emitter) Overloaded(reason string, retryAfter time.Duration) OverloadedEvent {
+	return OverloadedEvent{
+		Type:         "overloaded",
+		SessionID:    e.state.SessionID,
+		Reason:       reason,
+		RetryAfterMs: retryAfter.Milliseconds(),
 	}
 }
 

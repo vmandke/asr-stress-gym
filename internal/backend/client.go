@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,7 +29,48 @@ var (
 	// Capabilities.Serializable is false (docs/DECISIONS.md: true only on
 	// the mock adapter).
 	ErrNotSupported = errors.New("backend: checkpoint restore not supported by this adapter")
+	// ErrRateLimited is returned when a worker answers 429. Callers on the
+	// online path must NOT sleep on it — see RateLimitError and
+	// docs/build-plan.md: "A 500ms backoff is catastrophic against a 200ms
+	// budget. Move to another backend."
+	ErrRateLimited = errors.New("backend: rate limited")
 )
+
+// RateLimitError carries the worker's own Retry-After alongside
+// ErrRateLimited, so the router can zero that worker's bucket for exactly
+// as long as the worker askedrather than guessing a backoff.
+//
+// It wraps ErrRateLimited so `errors.Is(err, ErrRateLimited)` works for
+// callers that only need to know "not this backend, right now" — which is
+// every caller on the online path.
+type RateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("backend: rate limited, retry after %s", e.RetryAfter)
+}
+
+func (e *RateLimitError) Unwrap() error { return ErrRateLimited }
+
+// parseRetryAfter reads the header in its delta-seconds form, which is
+// what a worker under load realistically sends. The HTTP-date form is
+// deliberately not handled: it would need clock-skew reasoning between
+// two containers to gain nothing, and an unparseable value falls back to
+// a short default rather than to zero — zero would mean "retry
+// immediately", turning the one response designed to stop a storm into
+// the thing that causes one.
+func parseRetryAfter(h string) time.Duration {
+	const fallback = time.Second
+	if h == "" {
+		return fallback
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(h))
+	if err != nil || secs < 0 {
+		return fallback
+	}
+	return time.Duration(secs) * time.Second
+}
 
 // Capabilities mirrors worker/adapters/base.py's Capabilities dataclass.
 // A router (M3+) filters candidates on this before it ever scores one —
@@ -180,6 +223,13 @@ func (c *HTTPClient) Open(ctx context.Context, r OpenReq) (OpenResp, error) {
 		return OpenResp{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// A new session refused for rate. openWithRetry treats this like
+		// any other Open failure — try a different worker — which is
+		// exactly right: there is no state to preserve yet, so moving is
+		// free.
+		return OpenResp{}, &RateLimitError{RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return OpenResp{}, fmt.Errorf("backend: open: unexpected status %d", resp.StatusCode)
 	}
@@ -208,6 +258,9 @@ func (c *HTTPClient) Push(ctx context.Context, r PushReq) (PushResp, error) {
 
 	if resp.StatusCode == http.StatusConflict {
 		return PushResp{}, ErrStaleGeneration
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return PushResp{}, &RateLimitError{RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

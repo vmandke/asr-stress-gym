@@ -11,13 +11,16 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/coder/websocket"
 
+	"asr-stress-gym/internal/admission"
 	"asr-stress-gym/internal/audio"
 	"asr-stress-gym/internal/backend"
+	"asr-stress-gym/internal/bifrost"
 	"asr-stress-gym/internal/coord"
 	"asr-stress-gym/internal/metrics"
 	"asr-stress-gym/internal/router"
@@ -57,6 +60,23 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envInt reads an integer env var, falling back on absence OR on a value
+// that does not parse. A capacity knob that silently became 0 because
+// someone typed "200 " would turn the admission ceiling into "refuse
+// everyone", which is a worse failure than ignoring the override.
+func envInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		log.Printf("gateway: ignoring %s=%q (want a positive integer); using %d", key, v, fallback)
+		return fallback
+	}
+	return n
 }
 
 // parseWorkerURLs reads "id=url,id=url,..." — e.g.
@@ -125,6 +145,52 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(metrics.Snapshot())
 }
 
+// workersHandler exposes the router's live view of the fleet: each
+// worker's health status, load and rate-limit state.
+//
+// Chaos scenario 6 (gray failure) is the reason it exists. That scenario
+// asserts a worker is "ejected within 15s on latency, not errors" —
+// a statement purely about the ROUTER's internal state, which no other
+// endpoint reveals. Without this, the only way to test it is to infer
+// ejection from where traffic stopped going, which cannot distinguish
+// "ejected for latency" from "ejected for errors" and so cannot test the
+// thing the scenario is actually about.
+//
+// Read-only, and derived from the router rather than mirrored, so it
+// cannot drift from what selection really sees.
+func workersHandler(rt *router.Router, adm *admission.Controller) http.HandlerFunc {
+	type workerView struct {
+		ID           string `json:"id"`
+		Status       string `json:"status"`
+		Outstanding  int64  `json:"outstanding"`
+		RateLimited  bool   `json:"rate_limited"`
+		CompatKey    string `json:"compatibility_key_hash"`
+		Streaming    bool   `json:"streaming"`
+		Serializable bool   `json:"serializable"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		out := struct {
+			Workers           []workerView `json:"workers"`
+			AdmittedSessions  int64        `json:"admitted_sessions"`
+			HighWaterSessions int64        `json:"high_water_sessions"`
+		}{AdmittedSessions: adm.Admitted(), HighWaterSessions: adm.HighWater()}
+
+		for _, wk := range rt.Workers() {
+			out.Workers = append(out.Workers, workerView{
+				ID:           wk.ID,
+				Status:       wk.Status().String(),
+				Outstanding:  wk.Outstanding(),
+				RateLimited:  wk.Bucket.Blocked(),
+				CompatKey:    string(wk.CompatibilityKey),
+				Streaming:    wk.Capabilities.Streaming,
+				Serializable: wk.Capabilities.Serializable,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(out)
+	}
+}
+
 // corruptCheckpointHandler is chaos scenario 5's gateway-side fault
 // injection hook (build-plan.md demo 5: "corrupt checkpoint... validation
 // fails, falls back to audio replay, session still succeeds"). Checkpoints
@@ -152,9 +218,38 @@ func main() {
 		log.Printf("gateway: WARNING — no workers answered at startup; every session will fail until one becomes reachable")
 	}
 	checkpoints := coord.NewCheckpointStore()
+	adm := admission.New(admission.Config{
+		MaxSessions:  int64(envInt("MAX_SESSIONS", 200)),
+		SoftSessions: int64(envInt("SOFT_SESSIONS", 150)),
+		RetryAfter:   admissionRetryAfter,
+	})
+	// Nil unless BIFROST_URL is set — see internal/bifrost. A nil client
+	// means finals take the direct path, which is also the fallback on any
+	// Bifrost error, so this is never load-bearing for correctness.
+	var fallbacks []string
+	if raw := envOr("BIFROST_FALLBACKS", ""); raw != "" {
+		for _, f := range strings.Split(raw, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				fallbacks = append(fallbacks, f)
+			}
+		}
+	}
+	bf := bifrost.New(envOr("BIFROST_URL", ""), envOr("BIFROST_MODEL", ""), fallbacks, 15*time.Second)
+	if bf.Enabled() {
+		scope := "offline sessions only"
+		if envOr("BIFROST_FINALS", "") != "" {
+			scope = "offline sessions AND online finals"
+		}
+		log.Printf("gateway: Bifrost enabled at %s — routing %s via %s; partials always direct",
+			envOr("BIFROST_URL", ""), scope, bf.Describe())
+	}
+
 	cfg := connConfig{
-		Router:      rt,
-		Checkpoints: checkpoints,
+		Router:        rt,
+		Checkpoints:   checkpoints,
+		Admission:     adm,
+		Bifrost:       bf,
+		BifrostFinals: envOr("BIFROST_FINALS", "") != "",
 		NewAudioPipeline: func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error) {
 			return audio.NewVADPipeline(sampleRateHz, chunkMs, audio.DefaultVADConfig)
 		},
@@ -163,6 +258,7 @@ func main() {
 	dashMux := http.NewServeMux()
 	dashMux.HandleFunc("GET /health", healthHandler)
 	dashMux.HandleFunc("GET /api/debug/metrics", metricsHandler)
+	dashMux.HandleFunc("GET /api/debug/workers", workersHandler(rt, adm))
 	dashMux.HandleFunc("POST /api/debug/corrupt-checkpoint/{session_id}", corruptCheckpointHandler(checkpoints))
 
 	wsMux := http.NewServeMux()

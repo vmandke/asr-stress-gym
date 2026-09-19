@@ -23,8 +23,10 @@ import (
 
 	"github.com/coder/websocket"
 
+	"asr-stress-gym/internal/admission"
 	"asr-stress-gym/internal/audio"
 	"asr-stress-gym/internal/backend"
+	"asr-stress-gym/internal/bifrost"
 	"asr-stress-gym/internal/coord"
 	"asr-stress-gym/internal/journal"
 	"asr-stress-gym/internal/metrics"
@@ -47,6 +49,20 @@ const (
 	// a separate, unrelated knob on audio.Pipeline's own accumulator.
 	journalCapacity = 1500
 
+	// Chunk widths used once the gateway is above its soft session
+	// threshold — step 2 of build-plan.md's degradation order. Roughly
+	// 2x the healthy width: fewer, larger backend calls for the same
+	// audio, trading partial-update latency for throughput at the point
+	// where the alternative is refusing the session outright.
+	degradedOnlineChunkMs  = 320
+	degradedOfflineChunkMs = 4000
+
+	// admissionRetryAfter is what a client refused for lack of a capable
+	// worker is told to wait. Advisory, and deliberately short: the
+	// condition it reports (every worker ejected or out of budget) is
+	// usually seconds long, not minutes.
+	admissionRetryAfter = time.Second
+
 	writeTimeout      = 2 * time.Second
 	closeTimeout      = 2 * time.Second
 	checkpointTimeout = 2 * time.Second
@@ -60,6 +76,9 @@ const (
 type connConfig struct {
 	Router           *router.Router
 	Checkpoints      *coord.CheckpointStore
+	Admission        *admission.Controller
+	Bifrost          *bifrost.Client // nil unless BIFROST_URL — nil-safe throughout
+	BifrostFinals    bool            // route ONLINE finals through Bifrost too; off by default, see finalText
 	NewAudioPipeline func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error)
 }
 
@@ -74,6 +93,13 @@ func chunkMsFor(mode session.Mode) float64 {
 		return offlineChunkMs
 	}
 	return onlineChunkMs
+}
+
+func degradedChunkMs(mode session.Mode) float64 {
+	if mode == session.ModeOffline {
+		return degradedOfflineChunkMs
+	}
+	return degradedOnlineChunkMs
 }
 
 // inboundMsg is what readLoop hands to sessionLoop: either a decoded,
@@ -224,10 +250,17 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 	}
 
 	var (
-		started bool
-		client  backend.Client
+		started  bool
+		admitted bool
+		client   backend.Client
 	)
 	defer func() {
+		// Release before anything else can fail: the slot must come back
+		// even if the backend Close below errors, or a gateway that saw a
+		// few bad teardowns would leak capacity until it refused everyone.
+		if admitted {
+			cfg.Admission.Release()
+		}
 		if started {
 			cctx, ccancel := context.WithTimeout(context.Background(), closeTimeout)
 			if err := client.Close(cctx, state.Handle); err != nil {
@@ -261,7 +294,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 
 		switch f.Type {
 		case wire.MsgControl:
-			if !handleControl(ctx, cfg, f, &deps, events, &started, &client) {
+			if !handleControl(ctx, cfg, f, &deps, events, &started, &admitted, &client) {
 				return
 			}
 		case wire.MsgAudio:
@@ -269,7 +302,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 				trySend(ctx, events, emitter.Error("audio frame received before session.start"))
 				return
 			}
-			if !handleAudioFrame(ctx, f, deps, &client, events) {
+			if !handleAudioFrame(ctx, cfg, f, deps, &client, events) {
 				return
 			}
 		}
@@ -282,7 +315,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 func handleControl(
 	ctx context.Context, cfg connConfig, f wire.Frame,
 	deps *coord.RecoveryDeps, events chan<- any,
-	started *bool, client *backend.Client,
+	started *bool, admitted *bool, client *backend.Client,
 ) bool {
 	state, emitter := deps.State, deps.Emitter
 	msg, err := wire.DecodeControl(f.Payload)
@@ -302,6 +335,16 @@ func handleControl(
 			return false
 		}
 
+		// Admission first, before any work is done on this session's
+		// behalf. Refusing costs a pipeline construction and an Open if it
+		// happens later, and under a ramp that is precisely the work the
+		// gateway cannot afford — the point of refusing is to not spend.
+		if d := cfg.Admission.Admit(); d.Refused {
+			trySend(ctx, events, emitter.Overloaded(d.Reason, d.RetryAfter))
+			return false // retryable, and NOT an error event: the session was never created
+		}
+		*admitted = true
+
 		mode := session.Mode(m.Mode)
 		state.Mode = mode
 		state.SampleRateHz = m.SampleRateHz // needed again if a failover ever has to re-Open against a replacement
@@ -314,7 +357,13 @@ func handleControl(
 				return audio.NewPassthroughPipeline(sampleRateHz, chunkMs), nil
 			}
 		}
-		pipeline, err := newPipeline(uint32(m.SampleRateHz), chunkMsFor(mode))
+		// Step 2 of the degradation order: above the soft threshold a new
+		// session gets wider chunks, cutting its backend call volume
+		// before the gateway has to start refusing anyone. Decided once,
+		// here, because chunk boundaries are part of what a replay must
+		// reproduce (build-plan.md) and cannot change mid-session.
+		chunkMs := cfg.Admission.ChunkPolicy(chunkMsFor(mode), degradedChunkMs(mode))
+		pipeline, err := newPipeline(uint32(m.SampleRateHz), chunkMs)
 		if err != nil {
 			trySend(ctx, events, emitter.Error(fmt.Sprintf("audio pipeline setup failed: %v", err)))
 			return false
@@ -323,6 +372,18 @@ func handleControl(
 
 		target, resp, err := openWithRetry(ctx, cfg.Router, state.SessionID, mode, m)
 		if err != nil {
+			// ErrNoCapacity means the filter stage emptied — every worker
+			// is ejected, out of rate budget, or the wrong shape for this
+			// mode. That is retryable backpressure, not a broken session,
+			// so it gets `overloaded` like any other admission refusal.
+			// Anything else (a worker that accepted the pick and then
+			// failed to Open, repeatedly) is a real fault and stays
+			// terminal.
+			if errors.Is(err, router.ErrNoCapacity) {
+				metrics.AdmissionRejectedTotal.Add(1)
+				trySend(ctx, events, emitter.Overloaded("no capable worker available", admissionRetryAfter))
+				return false
+			}
 			trySend(ctx, events, emitter.Error(fmt.Sprintf("no worker available: %v", err)))
 			return false
 		}
@@ -359,12 +420,12 @@ func handleControl(
 		// recovery here. A deliberate, documented scope limit for M3,
 		// not an oversight — the window is narrow and the failure mode
 		// is a clean error, not a hang or silent corruption.
-		flushResp, err := (*client).Flush(ctx, state.Handle)
+		text, err := finalText(ctx, cfg, *deps, client, state.UtteranceStartSeq)
 		if err != nil {
 			trySend(ctx, events, emitter.Error(fmt.Sprintf("backend flush failed: %v", err)))
 			return false
 		}
-		finalEv, isNew := emitter.Final(flushResp.Text, 0, state.LastAppliedSeq)
+		finalEv, isNew := emitter.Final(text, 0, state.LastAppliedSeq)
 		if isNew {
 			// Trim on every committed final (build-plan.md). M1/M2: exactly
 			// one utterance per session, so the final's own seq_end is the
@@ -410,7 +471,7 @@ func openWithRetry(ctx context.Context, r *router.Router, sessionID string, mode
 	return nil, backend.OpenResp{}, fmt.Errorf("exhausted after %d attempts: %w", coord.MaxFailoverAttempts, lastErr)
 }
 
-func handleAudioFrame(ctx context.Context, f wire.Frame, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
+func handleAudioFrame(ctx context.Context, cfg connConfig, f wire.Frame, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
 	ref, err := deps.Pipeline.Ingest(f)
 	if err != nil {
 		trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("audio ingest failed: %v", err)))
@@ -446,27 +507,80 @@ func handleAudioFrame(ctx context.Context, f wire.Frame, deps coord.RecoveryDeps
 		}
 	}
 	if endpoint {
-		return finalizeEndpoint(ctx, deps, client, events)
+		return finalizeEndpoint(ctx, cfg, deps, client, events)
 	}
 	return true
+}
+
+// finalText produces an utterance's final transcript, through Bifrost or
+// via the pinned worker's Flush.
+//
+// **Which one, and why it is not simply "Bifrost when enabled".**
+//
+// build-plan.md reasons that a complete utterance IS a discrete stateless
+// request, so finals belong behind Bifrost. That is true of the AUDIO and
+// false of the WORKER. By the time an utterance ends, the pinned worker is
+// holding inference state built from exactly that audio — the accumulated
+// encoder and predictor context. A direct Flush finalizes that state. A
+// Bifrost-routed final cannot: /v1/audio/transcriptions is stateless by
+// construction (fresh state, infer, finalize, discard), so it throws the
+// hot state away and re-transcribes from raw samples.
+//
+// So routing an ONLINE final through Bifrost discards the very thing this
+// project is about, in order to recompute a result the pinned worker could
+// have produced from state it already held. It is off by default for that
+// reason (BifrostFinals) — not because of its latency, which is a symptom
+// of the same thing.
+//
+// OFFLINE is the opposite case, and the one Bifrost genuinely fits:
+// offline emits no partials, so nothing is being reused and nothing is
+// discarded; there is no latency budget, so retry-with-backoff is correct
+// rather than catastrophic; and the router has no advantage to offer — no
+// session to pin, no compatibility key to prefer, no hot state to preserve.
+// Backend selection for that class is Bifrost's to own.
+//
+// **Bifrost is never allowed to lose a final.** Any failure — unreachable,
+// timeout, non-200, malformed body — falls through to the direct path,
+// which is the same call the gateway would have made anyway.
+func finalText(ctx context.Context, cfg connConfig, deps coord.RecoveryDeps, client *backend.Client, startSeq uint64) (string, error) {
+	useBifrost := cfg.Bifrost.Enabled() &&
+		(deps.State.Mode == session.ModeOffline || cfg.BifrostFinals)
+	if useBifrost {
+		// The journal already holds every frame of this utterance,
+		// including the silence the VAD gated out of dispatch — so the
+		// audio handed to Bifrost is the utterance as CAPTURED, not as
+		// chunked. internal/audio wraps it; nothing here sees a sample.
+		records := deps.Journal.ReadAfter(startSeq)
+		if len(records) > 0 {
+			wav := audio.WAVFromRecords(records, uint32(deps.State.SampleRateHz))
+			text, err := cfg.Bifrost.Transcribe(ctx, wav)
+			if err == nil {
+				return text, nil
+			}
+			log.Printf("gateway[%s]: bifrost final failed, falling back to direct flush: %v",
+				deps.State.SessionID, err)
+		}
+	}
+	resp, err := (*client).Flush(ctx, deps.State.Handle)
+	return resp.Text, err
 }
 
 // finalizeEndpoint ends the current VAD-delimited utterance but keeps the
 // WebSocket session open. The worker handle is deliberately replaced: workers
 // expose a stateful streaming API, so continuing to Push after Flush would
 // make a new utterance inherit the old model state and transcript.
-func finalizeEndpoint(ctx context.Context, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
+func finalizeEndpoint(ctx context.Context, cfg connConfig, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
 	for _, c := range deps.Pipeline.Flush() {
 		if !dispatchChunk(ctx, c, deps, client, events) {
 			return false
 		}
 	}
-	flushResp, err := (*client).Flush(ctx, deps.State.Handle)
+	text, err := finalText(ctx, cfg, deps, client, deps.State.UtteranceStartSeq)
 	if err != nil {
 		trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("backend flush after endpoint failed: %v", err)))
 		return false
 	}
-	finalEv, isNew := deps.Emitter.Final(flushResp.Text, deps.State.UtteranceStartSeq, deps.State.LastAppliedSeq)
+	finalEv, isNew := deps.Emitter.Final(text, deps.State.UtteranceStartSeq, deps.State.LastAppliedSeq)
 	if isNew {
 		trimSeq := finalEv.SeqEnd
 		shouldTrim := true
@@ -540,6 +654,22 @@ func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, 
 			return false
 		}
 
+		// A 429 is NOT a dead backend, and must not be waited out.
+		// build-plan.md: "honour Retry-After, zero the bucket, and on the
+		// online path do not sleep. A 500ms backoff is catastrophic
+		// against a 200ms budget. Move to another backend."
+		//
+		// Zeroing the bucket is what makes the move stick: without it the
+		// router would keep scoring this worker as a fine candidate and
+		// failover could hand the session straight back to the backend
+		// that just refused it, which is how a retry storm starts. The
+		// failover path below then runs normally — from its point of view
+		// this worker has simply failed, which is true.
+		var rl *backend.RateLimitError
+		if errors.As(err, &rl) {
+			deps.Router.On429(deps.State.WorkerID, rl.RetryAfter)
+		}
+
 		newClient, resetEv, regenerated, ferr := coord.HandleBackendFailure(ctx, deps, err)
 		if ferr != nil {
 			trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("failover exhausted: %v", ferr)))
@@ -554,6 +684,7 @@ func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, 
 		}
 		return trySend(ctx, events, deps.Emitter.Partial(*regenerated))
 	}
+	metrics.BackendPushesTotal.Add(1)
 	// Successful calls are the router's source of real latency samples.
 	// Without this report the router's gray-failure policy only exists in
 	// unit tests: no live worker ever accumulates a p95 to compare against

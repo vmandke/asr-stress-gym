@@ -18,6 +18,23 @@ each.
 | Model weights | Fetched by `models/fetch.sh` at **image build time only**, baked into the worker image, never downloaded when a container starts. One image hosts all five adapters, so the ~365MB of weights is a single shared layer rather than five copies. |
 | Runtime versions | **Pinned exactly** in `worker/pyproject.toml`, not floored. `runtime_version` is one of the seven fields of the compatibility key, so an unpinned upgrade would silently change the fleet's identity — two workers built a week apart would stop being same-model and the cheap failover path would quietly disappear. A dependency bump is a fleet change. |
 | What "same model" means | Two workers are same-model because they run the same `ADAPTER` against the same baked weights — a fact about the image — not because they share a `MODEL` label. `MODEL` is display-only from M5 onward. |
+| Admission | Checked **once**, at `session.start`, and never again. Refusal is `overloaded` (retryable), not `error` (terminal). There is deliberately no mechanism capable of dropping an admitted session, because that is the only way to actually guarantee build-plan.md's step 5. |
+| Queueing | **None.** A refused session is refused now, not parked. build-plan.md: "Queueing converts a fast failure into a slow one. A transcript delivered eight seconds late is worthless." |
+| Rate-limit response | Never sleep on the online path. A 429 zeroes that worker's bucket for its own `Retry-After` and the session moves to another backend; backoff-and-retry is for the offline path, where nobody is waiting. |
+| Benchmark corpus | `corpus/large`, generated on demand and git-ignored (~200MB). Reproducible from `--seed`, so "the same corpus" is a number you pass rather than a blob you ship. The committed `corpus/*.wav` stay as protocol-level ground truth. |
+
+## The rate-limit division problem (deferred, not forgotten)
+
+build-plan.md flags it: "If each of N gateways runs a token bucket sized
+to the provider's full limit, you will overshoot by N×."
+
+With one gateway that does not bite, so `internal/router.Bucket` is sized
+per-gateway today. It is recorded here because the HA profile (M9) adds a
+second gateway, and that is the moment the bug appears — silently, as
+workers refusing traffic the fleet thought it had budget for. Whoever
+lands HA either divides the limit by the gateway count or moves the budget
+somewhere shared; what they must not do is add a gateway and leave this
+alone.
 
 ## M5 deviations from the planned fleet
 

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"asr-stress-gym/internal/backend"
+	"asr-stress-gym/internal/metrics"
 	"asr-stress-gym/internal/session"
 )
 
@@ -82,6 +83,12 @@ type Worker struct {
 
 	outstanding atomic.Int64 // sessions currently pinned here — BindSession/UnbindSession
 
+	// Bucket is the rate-limit budget from build-plan.md's "Selection"
+	// filter stage, which M3 explicitly deferred. Never nil for a worker
+	// built by NewWorker, but nil-safe throughout so a hand-constructed
+	// Worker in a test is simply unlimited rather than unusable.
+	Bucket *Bucket
+
 	mu        sync.Mutex
 	outcomes  []bool
 	latencies []time.Duration
@@ -92,7 +99,11 @@ type Worker struct {
 }
 
 func NewWorker(id string, client backend.Client, key session.CacheCompatibilityKey, caps backend.Capabilities) *Worker {
-	return &Worker{ID: id, Client: client, CompatibilityKey: key, Capabilities: caps, status: Healthy, backoff: ejectDuration}
+	return &Worker{
+		ID: id, Client: client, CompatibilityKey: key, Capabilities: caps,
+		status: Healthy, backoff: ejectDuration,
+		Bucket: NewBucket(defaultBucketLimit, defaultHeadroom),
+	}
 }
 
 func (w *Worker) Status() Status {
@@ -312,6 +323,12 @@ func (r *Router) Pick(mode session.Mode, exclude map[string]bool, prefer session
 		if !w.eligible(now) {
 			continue
 		}
+		// Rate-limit budget: the filter-stage constraint build-plan.md
+		// lists and M3 deferred. Read-only here — the winner is charged
+		// below, so considering a worker never costs it anything.
+		if !w.Bucket.Available() {
+			continue
+		}
 		if mode == session.ModeOnline && !w.Capabilities.Streaming {
 			continue
 		}
@@ -345,8 +362,27 @@ func (r *Router) Pick(mode session.Mode, exclude map[string]bool, prefer session
 	if best == nil {
 		return nil, ErrNoCapacity
 	}
+	// Charge the winner only. If its budget evaporated in the window
+	// between the filter pass and here — another session picking the same
+	// worker concurrently — report no capacity rather than handing out a
+	// worker we have just been told to stop using. The caller's retry
+	// will pick again against fresh state.
+	if !best.Bucket.Take() {
+		return nil, ErrNoCapacity
+	}
 	best.beginProbe() // no-op unless best was actually Ejected-and-eligible; see its doc comment
 	return best, nil
+}
+
+// On429 applies a worker's own rate-limit refusal to its bucket. Called
+// by whoever received the 429 — the point is that the gateway stops
+// choosing this worker, immediately, rather than sleeping on the online
+// path (build-plan.md: "Move to another backend").
+func (r *Router) On429(id string, retryAfter time.Duration) {
+	if w, ok := r.Find(id); ok {
+		w.Bucket.On429(retryAfter)
+		metrics.Backend429Total.Add(1)
+	}
 }
 
 // Report feeds back the outcome of one backend interaction for worker id

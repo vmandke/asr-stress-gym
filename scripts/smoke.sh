@@ -7,8 +7,9 @@ cd "$(dirname "$0")/.."
 
 source ./scripts/check_env.sh
 
-if [ ! -f corpus/01_short_greeting.wav ]; then
-  echo "corpus/ is empty — run ./scripts/gen_corpus.sh first (macOS only; corpus is committed, so this is a one-time step)" >&2
+if [ -z "$(find corpus/large -name '*.wav' -print -quit 2>/dev/null)" ]; then
+  echo "corpus/large/ is empty — run ./scripts/gen_corpus_large.py first (macOS only)." >&2
+  echo "It is git-ignored (~240MB) and reproducible from --seed, so a fresh checkout has none." >&2
   exit 1
 fi
 
@@ -47,6 +48,6 @@ while true; do
 done
 
 echo "--- cmd/smoketest ---"
-GATEWAY_WS_URL="ws://localhost:${GATEWAY_WS_PORT:-7070}/ws" go run ./cmd/smoketest --clip corpus/01_short_greeting.wav
+GATEWAY_WS_URL="ws://localhost:${GATEWAY_WS_PORT:-7070}/ws" go run ./cmd/smoketest  # --clip defaults to the large corpus
 
 echo "M1 smoke test passed."

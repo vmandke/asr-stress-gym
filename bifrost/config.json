@@ -1,0 +1,106 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "client": {
+    "enable_logging": true
+  },
+  "providers": {
+    "worker-mock": {
+      "keys": [
+        {
+          "name": "worker-mock-local",
+          "value": "dummy-local-no-auth",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://worker-mock:9000",
+        "allow_private_network": true
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai"
+      }
+    },
+    "worker-a": {
+      "keys": [
+        {
+          "name": "worker-a-local",
+          "value": "dummy-local-no-auth",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://worker-a:9000",
+        "allow_private_network": true
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai"
+      }
+    },
+    "worker-b": {
+      "keys": [
+        {
+          "name": "worker-b-local",
+          "value": "dummy-local-no-auth",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://worker-b:9000",
+        "allow_private_network": true
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai"
+      }
+    },
+    "worker-c": {
+      "keys": [
+        {
+          "name": "worker-c-local",
+          "value": "dummy-local-no-auth",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://worker-c:9000",
+        "allow_private_network": true
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai"
+      }
+    },
+    "worker-d": {
+      "keys": [
+        {
+          "name": "worker-d-local",
+          "value": "dummy-local-no-auth",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://worker-d:9000",
+        "allow_private_network": true
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai"
+      }
+    }
+  },
+  "config_store": {
+    "enabled": false
+  }
+}

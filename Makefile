@@ -1,4 +1,4 @@
-.PHONY: check up down build smoke test test-go test-worker models rtf matrix demo chaos bench
+.PHONY: check up down build smoke test test-go test-worker models rtf corpus inspect-chunks inspect-trace inspect-fleet vad-economics matrix demo chaos bench
 
 # Available now (M0-M1).
 check:
@@ -46,6 +46,35 @@ rtf: worker/.venv/bin/pytest
 	cd worker && .venv/bin/python ../scripts/measure_rtf.py
 
 test: test-go test-worker
+
+# --- inspection utilities (cmd/inspect) ------------------------------
+#
+# Each answers one question the source otherwise only answers by being
+# read. See docs/ARCHITECTURE.md, which is written from their output.
+
+# What does the gateway DO to this audio? Offline — needs nothing running.
+# CLIP=... to choose; defaults to a silence-heavy clip because that is
+# where chunking and VAD gating are most visible.
+CLIP ?= $(shell find corpus/large/silence_heavy -name '*.wav' 2>/dev/null | head -1)
+inspect-chunks:
+	go run ./cmd/inspect chunks $(CLIP)
+
+# Where does the TIME go? Live — one real session, every event stamped.
+inspect-trace:
+	go run ./cmd/inspect trace $(TRACE_CLIP)
+
+# What is the fleet right now — as the ROUTER sees it, not as each worker
+# reports itself. A worker can be healthy and still be ejected.
+inspect-fleet:
+	go run ./cmd/inspect fleet
+
+# Generate the large corpus (macOS only; git-ignored, ~200MB).
+corpus:
+	./scripts/gen_corpus_large.py
+
+# What does gating silence actually save? Needs a running stack.
+vad-economics:
+	./scripts/vad_economics.sh
 
 # Land at their milestone (docs/implementation-plan.md). Each fails loudly
 # rather than pretending to pass, so `make <target>` is always an honest

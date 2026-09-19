@@ -36,6 +36,41 @@ services:
       - "${GATEWAY_DASHBOARD_PORT:-7000}:7000"
     environment:
       DASHBOARD_ADDR: ":7000"
+      # Admission envelope (internal/admission). Overridable from the
+      # environment so a capacity run can lower it without a rebuild —
+      # chaos scenario 9 ramps to 150% of whatever this says, and doing
+      # that against the production default of 200 would mean 300 real
+      # streams on a laptop to prove a property that holds at any scale.
+      MAX_SESSIONS: "${MAX_SESSIONS:-200}"
+      SOFT_SESSIONS: "${SOFT_SESSIONS:-150}"
+      # Empty unless the `bifrost` profile is up. Empty means the gateway
+      # builds a nil Bifrost client and every final takes the direct path
+      # — which is also the fallback on any Bifrost failure, so this is
+      # safe to set and safe to leave unset.
+      BIFROST_URL: "${BIFROST_URL:-}"
+      # Which provider Bifrost routes a final to, and where it falls back.
+      # Each worker is its own provider (bifrost/config.json).
+      #
+      # The default primary is a zipformer worker rather than the Whisper
+      # one, for a measured reason: with every final going to Whisper, a
+      # 20-stream run showed final_p50 at 4721ms. Whisper re-transcribes the
+      # whole utterance; zipformer is the same family the partials came
+      # from, so the final is both fast and consistent with what the client
+      # has already displayed. Point this at worker-d/whisper-1 to trade
+      # latency for a second opinion from a different architecture.
+      BIFROST_MODEL: "${BIFROST_MODEL:-worker-a/whisper-1}"
+      # The ordered fallback chain. This is the one Bifrost feature doing
+      # real, non-duplicated work here: the gateway implements failover for
+      # the STREAMING path only (internal/coord) and has nothing equivalent
+      # for finals, so without this a dead primary means every final falls
+      # back to the local direct path and Bifrost contributes nothing.
+      BIFROST_FALLBACKS: "${BIFROST_FALLBACKS:-worker-b/whisper-1,worker-c/whisper-1,worker-mock/whisper-1}"
+      # Opt-in: route ONLINE finals through Bifrost too. Off by default
+      # because an online final has accumulated inference state behind it
+      # that a stateless Bifrost request discards and recomputes — see
+      # finalText in cmd/gateway/conn.go. Offline finals always route
+      # through Bifrost when it is enabled, because there is no such state.
+      BIFROST_FINALS: "${BIFROST_FINALS:-}"
       # id=url pairs, comma-separated (cmd/gateway/main.go's
       # parseWorkerURLs) — internal compose DNS names, port 9000 (the
       # worker's own port; 9001 is the supervisor's admin-only port, a
@@ -225,6 +260,42 @@ services:
       resources:
         limits: *worker-resources
     restart: "no"
+
+  # Opt-in: `docker compose --profile bifrost up -d`. Absent from the
+  # default fleet on purpose — build-plan.md puts Bifrost first on the cut
+  # line, and `make up` must not depend on it to work.
+  #
+  # Routes finals and offline jobs across every worker (bifrost/config.json).
+  # Partials never come through it; see docs/ARCHITECTURE.md §10.
+  bifrost:
+    image: maximhq/bifrost:latest
+    profiles: ["bifrost"]
+    ports:
+      - "${BIFROST_PORT:-8080}:8080"
+    volumes:
+      # Bifrost reads /app/data/config.json and additionally CREATES
+      # config.db and logs.db alongside it — it refuses to start on a
+      # read-only APP_DIR. Those two files are git-ignored; config.json,
+      # the part that is actually configuration, stays checked in.
+      - ./bifrost:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    restart: "no"
+    depends_on:
+      worker-mock: { condition: service_healthy }
+      worker-a: { condition: service_healthy }
+      worker-b: { condition: service_healthy }
+      worker-c: { condition: service_healthy }
+      worker-d: { condition: service_healthy }
 
   loadgen:
     build:

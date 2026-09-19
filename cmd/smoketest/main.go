@@ -31,9 +31,20 @@ import (
 
 func main() {
 	wsURL := flag.String("ws-url", envOr("GATEWAY_WS_URL", "ws://localhost:7070/ws"), "gateway WebSocket URL")
-	clipPath := flag.String("clip", envOr("SMOKETEST_CLIP", "corpus/01_short_greeting.wav"), "corpus WAV clip to stream")
+	clipPath := flag.String("clip", envOr("SMOKETEST_CLIP", ""), "corpus WAV clip to stream (default: the first clip in "+corpus.Dir+")")
 	fast := flag.Bool("fast", false, "send frames back-to-back instead of at 20ms real-time pacing")
 	flag.Parse()
+
+	// The large corpus by default (docs/BENCH.md). The committed 1-3s
+	// clips remain available via --clip for anything that needs a known,
+	// stable transcript.
+	if *clipPath == "" {
+		c, err := corpus.AnyClip()
+		if err != nil {
+			log.Fatalf("smoketest: %v", err)
+		}
+		*clipPath = c
+	}
 
 	failed := false
 	check := func(name string, err error) {

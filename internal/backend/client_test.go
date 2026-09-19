@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // Deliberately invalid UTF-8 (0xFF, 0xFE are never valid UTF-8 lead
@@ -245,5 +246,82 @@ func TestHTTPClientCheckpointUnknownHandle(t *testing.T) {
 	_, err := c.Checkpoint(context.Background(), "no-such-handle")
 	if err == nil {
 		t.Fatal("expected an error for an unknown handle")
+	}
+}
+
+// --- M7: rate limiting ---
+
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		header string
+		want   time.Duration
+	}{
+		{"5", 5 * time.Second},
+		{" 2 ", 2 * time.Second}, // whitespace from a hand-rolled header
+		{"0", 0},
+		// Every unparseable form falls back to a second rather than to
+		// zero. Zero would mean "retry immediately", turning the one
+		// response designed to STOP a storm into the thing that causes
+		// one — so this is a correctness fallback, not tidiness.
+		{"", time.Second},
+		{"Wed, 21 Oct 2015 07:28:00 GMT", time.Second}, // the HTTP-date form, deliberately unhandled
+		{"-3", time.Second},
+		{"banana", time.Second},
+	}
+	for _, c := range cases {
+		if got := parseRetryAfter(c.header); got != c.want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", c.header, got, c.want)
+		}
+	}
+}
+
+func TestPushReturnsRateLimitErrorOn429(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate_limited"}`))
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL)
+	_, err := c.Push(context.Background(), PushReq{Handle: "h1", SeqStart: 1, SeqEnd: 2, Audio: []byte{0, 0}})
+
+	// errors.Is is what the online path actually uses — it only needs to
+	// know "not this backend, right now".
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("got %v, want it to match ErrRateLimited", err)
+	}
+	// errors.As is what the router needs, to honour the worker's own
+	// Retry-After rather than guessing a backoff.
+	var rl *RateLimitError
+	if !errors.As(err, &rl) {
+		t.Fatalf("got %v, want a *RateLimitError", err)
+	}
+	if rl.RetryAfter != 3*time.Second {
+		t.Errorf("RetryAfter = %v, want 3s from the header", rl.RetryAfter)
+	}
+}
+
+func TestOpenReturnsRateLimitErrorOn429(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL)
+	_, err := c.Open(context.Background(), OpenReq{SessionID: "s1", SampleRateHz: 16000, Mode: "online"})
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("got %v, want ErrRateLimited — a new session refused for rate must be distinguishable from a broken worker", err)
+	}
+}
+
+func TestRateLimitErrorIsNotConfusedWithStaleGeneration(t *testing.T) {
+	// Both are non-fatal, both come back from Push, and the gateway does
+	// very different things with them: 409 is a coordinator bug worth an
+	// error event, 429 is backpressure worth a failover.
+	rl := &RateLimitError{RetryAfter: time.Second}
+	if errors.Is(rl, ErrStaleGeneration) {
+		t.Error("a rate-limit error must not match ErrStaleGeneration")
 	}
 }

@@ -24,6 +24,10 @@ dependencies = [
     "sherpa-onnx==1.13.8",   # zipformer (transducer), conformer_ctc, whisper_onnx
     "faster-whisper==1.2.1", # whisper_ct2; pulls ctranslate2
     "ctranslate2==4.8.2",
+    # Bifrost routes OpenAI-shaped multipart requests to the worker's
+    # /v1/audio/transcriptions (docs/build-plan.md, "The Bifrost
+    # boundary"). FastAPI cannot parse multipart without this.
+    "python-multipart==0.0.20",
 ]
 
 [project.optional-dependencies]

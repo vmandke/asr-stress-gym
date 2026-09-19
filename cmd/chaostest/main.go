@@ -65,11 +65,23 @@ func envOr(key, fallback string) string {
 }
 
 func main() {
-	scenario := flag.Int("scenario", 0, "chaos scenario to run: 2, 3, or 5")
+	scenario := flag.Int("scenario", 0, "chaos scenario to run: 2, 3, 4, 5, 6, 7, 10 or 11 (9 is scripts/scenarios/09_overload.sh)")
 	wsURL := flag.String("ws-url", envOr("GATEWAY_WS_URL", "ws://localhost:7070/ws"), "gateway WebSocket URL")
 	gatewayURL := flag.String("gateway-url", envOr("GATEWAY_DEBUG_URL", "http://localhost:7000"), "gateway dashboard/debug HTTP URL")
-	clipPath := flag.String("clip", "corpus/01_short_greeting.wav", "corpus WAV clip to stream")
+	clipPath := flag.String("clip", "", "corpus WAV clip to stream (default: the first clip in "+corpus.Dir+")")
 	flag.Parse()
+
+	// Default to the large corpus (docs/BENCH.md): 10-20s utterances, not
+	// the 1-3s committed clips. A scenario that fails over mid-utterance
+	// needs an utterance long enough to still be in progress when the
+	// fault lands.
+	if *clipPath == "" {
+		c, err := corpus.AnyClip()
+		if err != nil {
+			log.Fatalf("chaostest: %v", err)
+		}
+		*clipPath = c
+	}
 
 	fleet := defaultFleet()
 	if *scenario == -1 {
@@ -98,10 +110,20 @@ func main() {
 		err = scenario2SameModelCrash(*wsURL, *gatewayURL, *clipPath, fleet)
 	case 3:
 		err = scenario3CrossModelCrash(*wsURL, *gatewayURL, *clipPath, fleet)
+	case 4:
+		err = scenario4RateLimitStorm(*wsURL, *gatewayURL, *clipPath, fleet)
 	case 5:
 		err = scenario5CorruptCheckpoint(*wsURL, *gatewayURL, *clipPath, fleet)
+	case 6:
+		err = scenario6GrayFailure(*wsURL, *gatewayURL, *clipPath, fleet)
+	case 7:
+		err = scenario7Blackhole(*wsURL, *gatewayURL, *clipPath, fleet)
+	case 10:
+		err = scenario10LongSilence(*wsURL, *gatewayURL, fleet)
+	case 11:
+		err = scenario11AllBackendsDown(*wsURL, *gatewayURL, fleet)
 	default:
-		log.Fatalf("--scenario must be 2, 3, or 5 (got %d)", *scenario)
+		log.Fatalf("--scenario must be one of 2, 3, 4, 5, 6, 7, 10, 11 (got %d). Scenario 9 (overload) is scripts/scenarios/09_overload.sh — it needs the gateway restarted with a lowered capacity envelope, which is a shell concern", *scenario)
 	}
 	if err != nil {
 		log.Printf("FAIL scenario %d: %v", *scenario, err)
@@ -121,6 +143,9 @@ type metricsSnap struct {
 	FailoverExhaustedTotal     int64 `json:"failover_exhausted_total"`
 	CheckpointRestoresTotal    int64 `json:"checkpoint_restores_total"`
 	CheckpointDegradedTotal    int64 `json:"checkpoint_degraded_total"`
+	AdmissionRejectedTotal     int64 `json:"admission_rejected_total"`
+	Backend429Total            int64 `json:"backend_429_total"`
+	BackendPushesTotal         int64 `json:"backend_pushes_total"`
 }
 
 func fetchMetrics(gatewayURL string) (metricsSnap, error) {
@@ -159,17 +184,52 @@ func activeSessions(healthURL string) (int, error) {
 // one shows >0 — correct as long as this tool is the only session
 // touching the fleet at the time, which is true for a scripted,
 // sequential chaos run.
-func findPinnedWorker(candidates ...workerRef) (workerRef, error) {
+// sessionCounts snapshots active_sessions across candidates. Workers that
+// cannot be reached are omitted rather than recorded as 0, so a briefly
+// unreachable worker cannot later look like it GAINED the session.
+func sessionCounts(candidates ...workerRef) map[string]int {
+	out := make(map[string]int, len(candidates))
 	for _, w := range candidates {
+		if n, err := activeSessions(w.healthURL); err == nil {
+			out[w.id] = n
+		}
+	}
+	return out
+}
+
+// findPinnedWorker identifies which candidate a just-opened session landed
+// on, by finding the one whose active_sessions count went UP relative to
+// `before`.
+//
+// The obvious implementation — "return the first candidate reporting
+// active_sessions > 0" — is wrong, and wrong in a way that produces
+// confident false positives rather than errors. A worker holds a session
+// until the gateway calls Close on it, so any session that outlived its
+// gateway (a crashed or force-recreated gateway never runs its teardown)
+// is counted forever. A later scenario then "finds" that stale worker,
+// injects its fault there, and asserts against a worker the session under
+// test was never on. That is exactly how scenario 7 first failed: it
+// blackholed worker-a, which was holding a leaked session from an earlier
+// run, while the session it had just opened was quite happily streaming
+// through worker-b.
+//
+// A delta is immune to that, needs no server-side session registry, and
+// costs one extra round of /health.
+func findPinnedWorker(before map[string]int, candidates ...workerRef) (workerRef, error) {
+	for _, w := range candidates {
+		prior, known := before[w.id]
+		if !known {
+			continue // unreachable when the baseline was taken; cannot reason about its delta
+		}
 		n, err := activeSessions(w.healthURL)
 		if err != nil {
-			continue // this worker might be a red herring or briefly unreachable; keep looking
+			continue
 		}
-		if n > 0 {
+		if n > prior {
 			return w, nil
 		}
 	}
-	return workerRef{}, fmt.Errorf("none of %d candidates show an active session", len(candidates))
+	return workerRef{}, fmt.Errorf("none of %d candidates gained a session", len(candidates))
 }
 
 func killWorker(w workerRef) error {
@@ -212,40 +272,70 @@ type wsSession struct {
 	sessionID string
 }
 
+// dialSession opens the socket and starts the reader, but does NOT send
+// session.start. Split out from openSession so a caller that expects to be
+// REFUSED can inspect the gateway's first response itself.
+//
+// Scenario 11 is why. openSession treats anything that is not an `ack` as
+// an error, which is right for the eight scenarios that need a working
+// session — but it means a refusal is indistinguishable from a transport
+// failure, and a scenario asserting "clean error, no hang" would pass on
+// a dial that failed for entirely unrelated reasons.
+func dialSession(ctx context.Context, wsURL string) (*wsSession, error) {
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	s := &wsSession{conn: conn, events: make(chan map[string]any, 256), readErrs: make(chan error, 1)}
+	go s.readLoop(ctx)
+	return s, nil
+}
+
+// startSession sends session.start and returns the gateway's FIRST event,
+// whatever it is — ack, overloaded or error.
+func (s *wsSession) startSession(ctx context.Context) (map[string]any, error) {
+	sessionStart := []byte(`{"type":"session.start","mode":"online","sample_rate_hz":16000,"encoding":"pcm_s16le","channels":1,"nominal_frame_ms":20}`)
+	if err := s.writeFrame(ctx, wire.Frame{Type: wire.MsgControl, Seq: 0, Payload: sessionStart}); err != nil {
+		return nil, fmt.Errorf("send session.start: %w", err)
+	}
+	ev, err := s.next(ctx, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("read first event after session.start: %w", err)
+	}
+	return ev, nil
+}
+
+func (s *wsSession) readLoop(ctx context.Context) {
+	defer close(s.events)
+	for {
+		typ, data, err := s.conn.Read(ctx)
+		if err != nil {
+			s.readErrs <- err
+			return
+		}
+		if typ != websocket.MessageText {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal(data, &ev); err != nil {
+			s.readErrs <- fmt.Errorf("unmarshal event: %w", err)
+			return
+		}
+		s.events <- ev
+	}
+}
+
 func openSession(ctx context.Context, wsURL string) (*wsSession, error) {
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial: %w", err)
 	}
 	s := &wsSession{conn: conn, events: make(chan map[string]any, 256), readErrs: make(chan error, 1)}
+	go s.readLoop(ctx)
 
-	go func() {
-		defer close(s.events)
-		for {
-			typ, data, err := s.conn.Read(ctx)
-			if err != nil {
-				s.readErrs <- err
-				return
-			}
-			if typ != websocket.MessageText {
-				continue
-			}
-			var ev map[string]any
-			if err := json.Unmarshal(data, &ev); err != nil {
-				s.readErrs <- fmt.Errorf("unmarshal event: %w", err)
-				return
-			}
-			s.events <- ev
-		}
-	}()
-
-	sessionStart := []byte(`{"type":"session.start","mode":"online","sample_rate_hz":16000,"encoding":"pcm_s16le","channels":1,"nominal_frame_ms":20}`)
-	if err := s.writeFrame(ctx, wire.Frame{Type: wire.MsgControl, Seq: 0, Payload: sessionStart}); err != nil {
-		return nil, fmt.Errorf("send session.start: %w", err)
-	}
-	ack, err := s.next(ctx, 10*time.Second)
+	ack, err := s.startSession(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read ack: %w", err)
+		return nil, err
 	}
 	if ack["type"] != "ack" {
 		return nil, fmt.Errorf("got %v after session.start, want ack", ack)
@@ -278,11 +368,15 @@ func (s *wsSession) close() {
 // on a miss, a close.
 func openSessionPinnedToOneOf(ctx context.Context, wsURL string, maxAttempts int, candidates ...workerRef) (*wsSession, workerRef, error) {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Baseline BEFORE opening, so the session is identified by the
+		// count it adds rather than by any count already there — see
+		// findPinnedWorker.
+		before := sessionCounts(candidates...)
 		s, err := openSession(ctx, wsURL)
 		if err != nil {
 			return nil, workerRef{}, fmt.Errorf("attempt %d: %w", attempt, err)
 		}
-		pinned, err := findPinnedWorker(candidates...)
+		pinned, err := findPinnedWorker(before, candidates...)
 		if err == nil {
 			return s, pinned, nil
 		}

@@ -14,9 +14,17 @@ gateway_url="${GATEWAY_DEBUG_URL:-http://localhost:${dashboard_port}}"
 
 restore_worker() {
   local admin_url="$1" worker_url="$2"
-  # A worker that is already healthy reports {"spawned":true} too, so this is
-  # safe before every scenario. It also repairs a fleet left faulted by an
-  # interrupted prior run.
+  # die THEN restore, unconditionally, rather than restore alone.
+  #
+  # /admin/restore on a live child is a no-op, which leaves that child's
+  # accumulated session state in place — and a worker holds a session until
+  # the gateway Closes it, so any session that outlived its gateway (this
+  # script force-recreates the gateway between scenarios) is counted
+  # forever. A later scenario then detects the wrong "pinned" worker and
+  # injects its fault somewhere the session under test never was. That is
+  # exactly how scenario 7 first failed. Respawning guarantees every
+  # scenario starts against workers holding nothing.
+  curl --fail --silent --show-error -X POST "${admin_url}/admin/die" >/dev/null || true
   curl --fail --silent --show-error -X POST "${admin_url}/admin/restore" >/dev/null
 
   # Then WAIT for the respawned child to actually serve. /admin/restore
@@ -48,7 +56,10 @@ reset_fleet_for_scenario() {
   restore_all_workers
 
   # Workers retain their port bindings; only the gateway needs recreating to
-  # discard ejection/backoff state left by the preceding scenario.
+  # discard ejection/backoff state, rate-limit buckets and admitted-session
+  # counts left by the preceding scenario. All of that lives in the gateway
+  # process (internal/router, internal/admission), so a restart is the
+  # whole reset.
   GATEWAY_DASHBOARD_PORT="${dashboard_port}" docker compose up -d --force-recreate gateway
 
   for _ in $(seq 1 30); do
@@ -61,10 +72,22 @@ reset_fleet_for_scenario() {
   return 1
 }
 
-for scenario in 2 3 5; do
+# Order matters in exactly one place: scenario 11 kills the entire fleet,
+# so it runs last. Everything before it is order-independent because
+# reset_fleet_for_scenario respawns every worker and recreates the gateway
+# in between — the suite is a test suite, not three stateful demos whose
+# outcome depends on what ran before.
+#
+# Scenario 9 (overload) is not in this list: it needs the gateway restarted
+# with a lowered admission envelope, so it owns that lifecycle itself in
+# scripts/scenarios/09_overload.sh.
+for scenario in 2 3 4 5 6 7 10 11; do
   reset_fleet_for_scenario
   GATEWAY_DEBUG_URL="${gateway_url}" go run ./cmd/chaostest --scenario "${scenario}"
 done
+
+reset_fleet_for_scenario
+GATEWAY_DEBUG_URL="${gateway_url}" ./scripts/scenarios/09_overload.sh
 
 # Leave the local fleet usable after the intentionally destructive tests.
 restore_all_workers

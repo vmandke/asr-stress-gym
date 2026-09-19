@@ -1,25 +1,58 @@
-# Go
+# --- Go ---------------------------------------------------------------
 /bin/
 *.test
 *.out
 
-# Python
+# Compiled binaries land at the repo root when someone runs
+# `go build ./cmd/<name>` without -o. Go binaries have no extension, so
+# there is nothing to glob — each one is listed. Add a line here when a
+# new cmd/ is added.
+/gateway
+/loadgen
+/smoketest
+/chaostest
+/matrix
+/inspect
+
+# --- Python -----------------------------------------------------------
 __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+.pytest_cache/
 
-# Model weights: fetched at image build time (models/fetch.sh), never committed.
-# Corpus clips ARE committed (see corpus/README.md) — do not add corpus/ here.
+# --- Model weights ----------------------------------------------------
+# Fetched at image build time by models/fetch.sh, never committed.
 models/download/
 models/.cache/
 
-# Benchmark/chaos output
+# --- Corpus -----------------------------------------------------------
+# corpus/*.wav ARE committed (see corpus/README.md): twelve short clips
+# that serve as stable ground truth for protocol-level assertions. Do NOT
+# add corpus/ here.
+#
+# corpus/large is the exception — ~200 clips across six kinds, ~200MB,
+# generated on demand by scripts/gen_corpus_large.py and reproducible from
+# its --seed. A build artifact, not an asset to ship.
+corpus/large/
+
+# --- Bifrost ----------------------------------------------------------
+# bifrost/config.json and README.md are checked in; Bifrost creates its
+# own SQLite stores beside them at runtime and refuses to start on a
+# read-only APP_DIR.
+#
+# The glob is *.db* rather than *.db on purpose: SQLite in WAL mode writes
+# `logs.db-shm` and `logs.db-wal` sidecars, and the -wal file alone was
+# 2.6MB after a single run. `*.db` does not match either of them.
+bifrost/*.db*
+bifrost/logs/
+
+# --- Benchmark / chaos output -----------------------------------------
 /results/
 *.csv
 !corpus/**/*.csv
 
-# Editor / OS
+# --- Editor / OS ------------------------------------------------------
 .DS_Store
 .idea/
 .vscode/

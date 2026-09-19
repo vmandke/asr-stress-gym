@@ -154,11 +154,109 @@ combination.
 
 ## M7 — load, backpressure, rate limits, Bifrost
 
-- [ ] `cmd/loadgen`: paced client, all flags (`--streams --ramp --speech-ratio --jitter-ms --drop-pct --reconnect-every --mode --out`)
-- [ ] Admission control, five-step degradation order
-- [ ] Token buckets w/ headroom, `Retry-After` honored, no sleep on online path
-- [ ] Bifrost wired to worker-d's OpenAI-compatible endpoint, `BIFROST_ENABLED` flag + direct fallback
-- [ ] **Done-when:** scenarios 4, 6, 7, 9, 10, 11 pass; speech-ratio 1.0 vs 0.5 halves backend call volume
+- [x] `docs/BENCH.md` — loadgen's CLI and CSV frozen as a contract **before** the implementation, so M8 could start without waiting on this milestone's source
+- [x] `cmd/loadgen`: paced client, all flags (`--streams --ramp --speech-ratio --jitter-ms --drop-pct --reconnect-every --mode --out`), event CSV + summary
+- [x] Admission control (`internal/admission`): steps 4 and 5, plus step 2 (chunk widening above a soft threshold). Steps 1 and 3 were already the router's scoring and capability filter
+- [x] `overloaded` event — retryable, distinct from terminal `error`, emitted only at `session.start`
+- [x] Token buckets with headroom (`internal/router/bucket.go`), `Retry-After` honoured, **no sleep on the online path** — a 429 zeroes the bucket and the session moves
+- [x] `corpus/large`: ~200 clips across six kinds (monologue, dialogue, long_form, silence_heavy, rapid_turns, noisy) with per-utterance boundaries in the manifest. Every test/bench/chaos path reads it
+- [x] Chaos scenarios **4** (429 storm), **6** (gray failure), **7** (blackhole), **9** (overload), **10** (long silence), **11** (all backends down) — all passing against the real fleet
+- [x] `GET /api/debug/workers` — the router's live health/load/rate-limit view. Scenario 6 asserts "ejected on latency, not errors", which is a claim about router state that nothing else exposed
+- [x] Bifrost wired — **all five workers**, not just worker-d; `BIFROST_URL` (default empty) + direct fallback on any failure
+- [x] Worker `POST /v1/audio/transcriptions` — OpenAI-shaped, multipart, stateless; verified across all five adapters
+- [x] **Done-when: all three bars met.** Scenarios 4, 6, 7, 9, 10, 11 pass against the real fleet; speech-ratio measured (below); Bifrost routes finals with partials staying direct
+
+**M7 is done.**
+
+### Bifrost, verified end to end
+
+With `BIFROST_URL` set, one session's final arrives as
+`"Please transfer 50,000 rupees to Mira from..."` — punctuated Whisper text
+from worker-d — while its 89 partials streamed from the pinned zipformer
+worker at 20.0ms p50. Bifrost's own log shows the gateway's request
+(`Go-http-client/1.1` from the gateway's container IP) returning 200.
+
+**The proxy itself is nearly free.** Same clip, three runs each against
+worker-d: direct `0.616 / 0.582 / 0.576`s, through Bifrost
+`0.596 / 0.605 / 0.588`s — overlapping ranges, single-digit-millisecond
+overhead.
+
+**But routing an online final through it is still wrong by default**, and
+for a better reason than latency. `/v1/audio/transcriptions` is stateless
+by construction, so a Bifrost-routed final discards the pinned worker's
+accumulated inference state and re-transcribes from raw audio — where a
+direct `flush` finalizes state the worker already holds:
+
+```
+direct flush       9.2 ms    "mock1 mock2 mock3 ..."
+via Bifrost      265.3 ms    "FIFTY THOUSAND RUPEES TO MIRR..."   ← recomputed, different model
+```
+
+29×, and the cheap path is cheap *because* the state is already there.
+Online finals are therefore opt-in (`BIFROST_FINALS=1`); **offline sessions
+route through Bifrost by default**, because offline has no partials, no hot
+state to discard, and no latency budget — the one class where
+retry-with-backoff is correct and the router has no advantage to offer.
+
+Two framings were wrong along the way and are recorded because both are
+easy: first attributing the whole 641ms to the proxy (it was the model),
+then treating "a complete utterance is a discrete request" as settling the
+question (true of the audio, false of the worker holding state built from
+it).
+
+All five workers are registered, so Bifrost's fallback and weighted
+routing have somewhere to go. Routing to a single provider would have made
+those features inert.
+
+### Bifrost findings
+
+| What | How it surfaced | Resolution |
+|---|---|---|
+| `base_url` inside a `keys[]` entry is ignored | Requests came back 401 with OpenAI's *own* error text about an invalid API key — the config was being ignored, not applied, and traffic was silently leaving for `api.openai.com` | `base_url` is per **provider**, in `network_config`. Five workers therefore need five providers with `custom_provider_config.base_provider_type: "openai"`, not five keys of one |
+| `connection to private IP 172.19.0.4 is not allowed` | Once routing was right, Bifrost's SSRF guard blocked the compose network | `allow_private_network: true` per provider. Found in the binary's own strings — it is not in the published config docs |
+| Two rebuild traps | A 404 from every worker, then a gateway that ignored `BIFROST_URL` despite the env var being set in the container | `--force-recreate` does **not** rebuild. Both times the image predated the code. `up -d --build` |
+| Bifrost refuses a read-only `APP_DIR` | Container exited 1 immediately | It creates `config.db`/`logs.db` beside `config.json`. Mount read-write; the SQLite **WAL sidecars** (`.db-wal` was 2.6MB after one run) need `bifrost/*.db*`, since `*.db` matches neither `-wal` nor `-shm` |
+| Per-request `fallbacks` are undocumented for non-chat endpoints | Needed to know whether Bifrost could do real work here at all | Tested directly: SIGKILL the primary worker, send a request naming it with a `fallbacks` chain — a transcript came back, served by the next provider. It **does** work on `/v1/audio/transcriptions`. This is the one Bifrost feature doing non-duplicated work, since `internal/coord` covers streaming failover only |
+
+### All nine chaos scenarios pass with Bifrost enabled
+
+`2, 3, 4, 5, 6, 7, 9, 10, 11` — `duplicate_finals_total == 0` throughout.
+One number worth keeping from the run: with every final forced through
+Whisper under 20 concurrent streams, `final_p50` was **4721ms**. That is
+what made the default primary a zipformer worker rather than the Whisper
+one.
+
+### The VAD economic argument, measured
+
+The plan words the bar as "`--speech-ratio 1.0` vs `0.5` shows backend call
+volume halving". Measured, it does not exactly halve, and the gap is the
+interesting part — so `scripts/vad_economics.sh` reports the real numbers
+against two reference lines rather than asserting a round figure:
+
+| speech ratio | ungated | perfect gating | actual | recovered |
+|---|---|---|---|---|
+| 1.0 | 300 | 300 | 294 | — |
+| 0.75 | 298 | 223 | 250 | 64% |
+| 0.5 | 298 | 149 | 174 | **83%** |
+| 0.25 | 299 | 75 | 105 | **86%** |
+
+`actual` sits above `perfect` because a VAD with pre-roll and hangover
+deliberately dispatches a little silence either side of speech — clipping
+a word's onset to save a backend call is a bad trade. Halving the speech
+ratio cuts backend calls by **41%**, not 50%, and the VAD captures 83-86%
+of the theoretically available saving at realistic silence fractions.
+Reported, not rounded up.
+
+### Bugs and findings from building M7
+
+| What | How it surfaced | Resolution |
+|---|---|---|
+| Partial latency measured against the wrong frame | Reasoning about what `latency_ms` means when the gateway is slow | A `partial` carries no seq, so "time since the last frame written" under-reports badly under load — the partial for seq 9 arriving after frame 15 reads as 20ms instead of 120ms. **Overload would have looked fast.** loadgen now holds each partial until the following `ack`, whose seq identifies the chunk |
+| `findPinnedWorker` picked a worker holding a *leaked* session | Scenario 7 blackholed worker-a while the session under test streamed happily through worker-b | A worker holds a session until the gateway Closes it, so any session that outlived its gateway is counted forever. Inferring "pinned" from an absolute count is a confident false positive; it is now a **delta** against a baseline taken before the open |
+| `/admin/restore` treated as "ready" | Scenario 3 failed intermittently right after scenario 2's kills, then passed alone | Restore returns when the child is *spawned*; a real child then loads weights. `chaos.sh` now waits on the worker's own `/health`, and die-then-restores so no scenario inherits leaked sessions |
+| `streams_refused` never incremented | Scenario 9 failed with `refused=0` while `overloaded=10` | Two different questions — refusal *events* vs streams that never got a session — and only the second is comparable against `--streams` |
+| Scenario 9 asserted `finals == streams_opened` | Failed on a perfectly healthy run: 20 admitted, 67 finals | M4's endpointing closes an utterance per pause, so one session legitimately yields many finals. The assertion was wrong, not the system |
+| Scenario 11 could pass vacuously | 0.27s pass looked too fast to be real | It took an `else` branch that only checked elapsed time, never inspecting the response. Now dials and sends `session.start` explicitly, asserts the event is `overloaded`/`error`, and bounds the refusal at 10s so a timeout unwinding cannot pass as an admission decision |
 
 ## M8 — benchmarks and charts
 

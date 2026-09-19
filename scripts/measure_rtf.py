@@ -45,6 +45,11 @@ from adapters.registry import _REGISTRY, build  # noqa: E402
 CHUNK_MS = 200
 REPEATS = 3  # median of three; a single cold run is dominated by first-call warmup
 
+# A sample of the corpus, not all 500 clips: at ~15s each, the full corpus
+# would be ~2 hours of audio per adapter per repeat. Twelve clips is ~3
+# minutes of audio, enough to average over utterance variety.
+RTF_CLIPS = 12
+
 
 def load_clip(path: Path) -> bytes:
     with wave.open(str(path)) as w:
@@ -90,7 +95,24 @@ def measure(name: str, clips: list[bytes]) -> dict:
 def main() -> None:
     names = os.environ.get("ADAPTERS")
     names = names.split(",") if names else sorted(_REGISTRY)
-    clip_paths = sorted((REPO / "corpus").glob("*.wav"))
+    # The large corpus (10-20s utterances), not the committed 1-3s clips:
+    # RTF on a 1.2s clip is dominated by the per-utterance finalize cost,
+    # which makes short-clip numbers look far worse than the steady-state
+    # throughput they are quoted as. A bounded sample keeps this to
+    # seconds rather than minutes while still averaging over real variety.
+    corpus_dir = REPO / "corpus" / "large"
+    # rglob: one subdirectory per clip kind. Taking a stride across the
+    # sorted list rather than the first N keeps the sample spread over all
+    # kinds — the first 12 would be twelve dialogues and would report
+    # dialogue RTF as if it were the fleet's.
+    all_clips = sorted(corpus_dir.rglob("*.wav"))
+    stride = max(1, len(all_clips) // RTF_CLIPS) if all_clips else 1
+    clip_paths = all_clips[::stride][:RTF_CLIPS]
+    if not clip_paths:
+        raise SystemExit(
+            f"no clips in {corpus_dir} — run scripts/gen_corpus_large.py "
+            "(it is git-ignored, so a fresh checkout has none)"
+        )
     clips = [load_clip(p) for p in clip_paths]
     total_audio_s = sum(pcm.duration_s(c) for c in clips)
 

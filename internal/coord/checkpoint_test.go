@@ -101,7 +101,7 @@ func TestNilCheckpointStoreIsSafe(t *testing.T) {
 		t.Fatal("expected false from Corrupt on a nil store")
 	}
 	s.Store("s1", "K1", backend.CheckpointResp{CheckpointBlob: []byte("x")}) // must not panic
-	s.Delete("s1")                                                          // must not panic
+	s.Delete("s1")                                                           // must not panic
 }
 
 func TestCheckpointStoreDelete(t *testing.T) {

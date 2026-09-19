@@ -89,7 +89,7 @@ binary format. Readability wins where the rate argument doesn't apply.
 | `partial.reset` | Discard what is displayed; a failover occurred. **Always** emitted on failover, same-model or cross — see below. | **M3** |
 | `final` | Immutable; exactly one per utterance; carries its audio range. | **M1** (on `session.end`) |
 | `discontinuity` | Audio was lost between these sequence numbers. | **M1** |
-| `overloaded` | Admission refused; retryable. | M7 (backpressure) |
+| `overloaded` | Admission refused; retryable. Never mid-session — see below. | **M7** |
 | `error` | Terminal for this session. | **M1** |
 
 ```json
@@ -107,8 +107,30 @@ binary format. Readability wins where the rate argument doesn't apply.
 { "type": "final", "session_id": "s1", "utterance_id": "u1",
   "seq_start": 0, "seq_end": 220, "text": "..." }
 
+{ "type": "overloaded", "session_id": "s1",
+  "reason": "gateway at session capacity", "retry_after_ms": 1000 }
+
 { "type": "error", "session_id": "s1", "reason": "duration_mismatch" }
 ```
+
+**`overloaded` is not `error`.** `error` is terminal for the session;
+`overloaded` says the session was *never created* and the client may
+retry. That distinction is the whole of docs/build-plan.md's degradation
+step 4 ("reject NEW sessions with `overloaded` (retryable)"), which is
+ordered deliberately ahead of step 5 ("never drop an already-admitted
+session"). A client that cannot tell refusal from failure either retries
+a terminal error forever or gives up on a recoverable one.
+
+It is emitted in exactly two situations, both at `session.start` and never
+mid-session:
+
+- the gateway is at its admitted-session ceiling (`MAX_SESSIONS`), or
+- the router has no usable worker for this mode — every candidate ejected,
+  out of rate-limit budget, or the wrong shape for the traffic
+  (`router.ErrNoCapacity`).
+
+`retry_after_ms` is advisory: the gateway's estimate of when capacity
+might exist, not a promise.
 
 Guarantees (see `internal/session` for enforcement, one place only):
 

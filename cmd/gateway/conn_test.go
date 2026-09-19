@@ -14,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"asr-stress-gym/internal/admission"
 	"asr-stress-gym/internal/coord"
 	"asr-stress-gym/internal/wire"
 )
@@ -210,7 +211,7 @@ func newTestGateway(t *testing.T) string {
 	if len(rt.Workers()) == 0 {
 		t.Fatal("buildRouter found no usable worker — check the fake /health handler above")
 	}
-	cfg := connConfig{Router: rt, Checkpoints: coord.NewCheckpointStore()}
+	cfg := connConfig{Router: rt, Checkpoints: coord.NewCheckpointStore(), Admission: admission.New(admission.DefaultConfig())}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
@@ -234,7 +235,7 @@ func newTestGatewayFromWorkers(t *testing.T, urls map[string]string) string {
 	if len(rt.Workers()) != len(urls) {
 		t.Fatalf("buildRouter found %d workers, want %d (check each fake's /health handler)", len(rt.Workers()), len(urls))
 	}
-	cfg := connConfig{Router: rt, Checkpoints: coord.NewCheckpointStore()}
+	cfg := connConfig{Router: rt, Checkpoints: coord.NewCheckpointStore(), Admission: admission.New(admission.DefaultConfig())}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
@@ -618,4 +619,133 @@ func TestFailoverWithNoSurvivingWorkerFailsCleanly(t *testing.T) {
 	if _, _, err := c.Read(ctx); err == nil {
 		t.Fatal("expected the connection to close after total failure, but it stayed open")
 	}
+}
+
+// --- M7: admission control and backpressure ---
+
+// newTestGatewayWithAdmission is newTestGateway with an explicit capacity
+// envelope, so the refusal path can be exercised at 2 sessions instead of
+// the production default of 200.
+func newTestGatewayWithAdmission(t *testing.T, cfgA admission.Config) string {
+	t.Helper()
+	worker := newFakeWorker(t)
+	t.Cleanup(worker.Close)
+
+	rt := buildRouter(map[string]string{"fake": worker.URL})
+	if len(rt.Workers()) == 0 {
+		t.Fatal("buildRouter found no usable worker")
+	}
+	cfg := connConfig{Router: rt, Checkpoints: coord.NewCheckpointStore(), Admission: admission.New(cfgA)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			t.Logf("ws accept: %v", err)
+			return
+		}
+		handleConnection(r.Context(), ws, cfg)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return "ws" + srv.URL[len("http"):] + "/ws"
+}
+
+// Build-plan.md's degradation step 4: a session refused for capacity gets
+// `overloaded` (retryable), NOT `error` (terminal). A client that cannot
+// tell the two apart either retries a terminal failure forever or gives
+// up on a recoverable one.
+func TestSessionBeyondCapacityIsRefusedWithOverloaded(t *testing.T) {
+	wsURL := newTestGatewayWithAdmission(t, admission.Config{MaxSessions: 1, SoftSessions: 1, RetryAfter: 2 * time.Second})
+
+	held := dial(t, wsURL)
+	defer held.Close(websocket.StatusNormalClosure, "")
+	sendControl(t, held, 0, sessionStartJSON)
+	if ev := readEvent(t, held); ev["type"] != "ack" {
+		t.Fatalf("first session: got %v, want ack", ev)
+	}
+
+	refused := dial(t, wsURL)
+	defer refused.Close(websocket.StatusNormalClosure, "")
+	sendControl(t, refused, 0, sessionStartJSON)
+
+	ev := readEvent(t, refused)
+	if ev["type"] != "overloaded" {
+		t.Fatalf("second session: got %v, want overloaded", ev)
+	}
+	if ev["retry_after_ms"] != float64(2000) {
+		t.Errorf("retry_after_ms = %v, want 2000 — a refusal must say when to come back", ev["retry_after_ms"])
+	}
+	if reason, _ := ev["reason"].(string); reason == "" {
+		t.Error("overloaded carried no reason")
+	}
+}
+
+// Step 5: "never drop an already-admitted session." The session admitted
+// before the ceiling was reached must keep working normally while others
+// are being refused — that ordering is the entire point of refusing.
+func TestAdmittedSessionIsUnaffectedByRefusals(t *testing.T) {
+	wsURL := newTestGatewayWithAdmission(t, admission.Config{MaxSessions: 1, SoftSessions: 1, RetryAfter: time.Second})
+
+	held := dial(t, wsURL)
+	defer held.Close(websocket.StatusNormalClosure, "")
+	sendControl(t, held, 0, sessionStartJSON)
+	if ev := readEvent(t, held); ev["type"] != "ack" {
+		t.Fatalf("got %v, want ack", ev)
+	}
+
+	for i := 0; i < 5; i++ {
+		c := dial(t, wsURL)
+		sendControl(t, c, 0, sessionStartJSON)
+		if ev := readEvent(t, c); ev["type"] != "overloaded" {
+			t.Fatalf("refusal %d: got %v, want overloaded", i, ev)
+		}
+		c.Close(websocket.StatusNormalClosure, "")
+	}
+
+	// The admitted session still streams and still finalizes.
+	sendAudio(t, held, 1, 200)
+	sawPartial := false
+	for i := 0; i < 4 && !sawPartial; i++ {
+		if readEvent(t, held)["type"] == "partial" {
+			sawPartial = true
+		}
+	}
+	if !sawPartial {
+		t.Fatal("the admitted session stopped producing partials while others were refused")
+	}
+}
+
+// Capacity must come back when a session ends, or a gateway that has
+// merely been busy once refuses everyone forever.
+func TestCapacityIsReleasedWhenASessionEnds(t *testing.T) {
+	wsURL := newTestGatewayWithAdmission(t, admission.Config{MaxSessions: 1, SoftSessions: 1, RetryAfter: time.Second})
+
+	first := dial(t, wsURL)
+	sendControl(t, first, 0, sessionStartJSON)
+	if ev := readEvent(t, first); ev["type"] != "ack" {
+		t.Fatalf("got %v, want ack", ev)
+	}
+	sendControl(t, first, 1, `{"type":"session.end"}`)
+	// Drain until the final, which is what says the session is finished.
+	for i := 0; i < 8; i++ {
+		if readEvent(t, first)["type"] == "final" {
+			break
+		}
+	}
+	first.Close(websocket.StatusNormalClosure, "")
+
+	// The slot is released by sessionLoop's defer, which runs after the
+	// socket closes; poll rather than assume it has already happened.
+	var lastEv map[string]any
+	for attempt := 0; attempt < 50; attempt++ {
+		c := dial(t, wsURL)
+		sendControl(t, c, 0, sessionStartJSON)
+		lastEv = readEvent(t, c)
+		c.Close(websocket.StatusNormalClosure, "")
+		if lastEv["type"] == "ack" {
+			return // capacity came back
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("capacity never came back after the first session ended; last response was %v", lastEv)
 }

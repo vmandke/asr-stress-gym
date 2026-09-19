@@ -58,6 +58,29 @@ var (
 	// are where that degradation becomes a number instead of a claim.
 	CheckpointRestoresTotal atomic.Int64 // a checkpoint was validated and restored; only the tail was replayed
 	CheckpointDegradedTotal atomic.Int64 // same key, but no usable checkpoint — fell through to full audio replay
+
+	// --- M7: load, backpressure, rate limits ---
+
+	// AdmissionRejectedTotal counts sessions refused with `overloaded`.
+	// Non-zero is not a fault: build-plan.md's degradation order puts
+	// "reject NEW sessions" at step 4 and "never drop an already-admitted
+	// session" at step 5, so a rising count here alongside a flat error
+	// count is the system working. What would be a fault is this staying
+	// at zero while admitted sessions start failing.
+	AdmissionRejectedTotal atomic.Int64
+
+	// Backend429Total counts rate-limit refusals observed FROM workers,
+	// per the metrics list in build-plan.md. Distinct from
+	// AdmissionRejectedTotal, which is the gateway refusing its own
+	// callers.
+	Backend429Total atomic.Int64
+
+	// BackendPushesTotal is the denominator of the VAD economic argument:
+	// M7's done-when is that halving --speech-ratio halves backend call
+	// volume. That claim needs the call volume to be counted somewhere,
+	// and the client cannot see it — loadgen is a client and has no view
+	// of what the gateway did or did not dispatch.
+	BackendPushesTotal atomic.Int64
 )
 
 // Snap is a point-in-time read of every counter, JSON-tagged for the
@@ -71,6 +94,9 @@ type Snap struct {
 	FailoverExhaustedTotal     int64 `json:"failover_exhausted_total"`
 	CheckpointRestoresTotal    int64 `json:"checkpoint_restores_total"`
 	CheckpointDegradedTotal    int64 `json:"checkpoint_degraded_total"`
+	AdmissionRejectedTotal     int64 `json:"admission_rejected_total"`
+	Backend429Total            int64 `json:"backend_429_total"`
+	BackendPushesTotal         int64 `json:"backend_pushes_total"`
 }
 
 func Snapshot() Snap {
@@ -83,5 +109,8 @@ func Snapshot() Snap {
 		FailoverExhaustedTotal:     FailoverExhaustedTotal.Load(),
 		CheckpointRestoresTotal:    CheckpointRestoresTotal.Load(),
 		CheckpointDegradedTotal:    CheckpointDegradedTotal.Load(),
+		AdmissionRejectedTotal:     AdmissionRejectedTotal.Load(),
+		Backend429Total:            Backend429Total.Load(),
+		BackendPushesTotal:         BackendPushesTotal.Load(),
 	}
 }
