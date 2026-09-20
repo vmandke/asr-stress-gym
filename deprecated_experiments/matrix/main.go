@@ -17,7 +17,7 @@ import (
 	"asr-stress-gym/internal/backend"
 )
 
-const defaultWorkers = "worker-mock=http://localhost:18000,worker-a=http://localhost:18001,worker-b=http://localhost:18002,worker-c=http://localhost:18003,worker-d=http://localhost:18004,worker-e=http://localhost:18005"
+const defaultWorkers = "worker-a=http://localhost:18001,worker-b=http://localhost:18002,worker-c=http://localhost:18003,worker-d=http://localhost:18004,worker-e=http://localhost:18005,worker-f=http://localhost:18007,worker-g=http://localhost:18008"
 
 type worker struct {
 	id     string

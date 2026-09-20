@@ -1,0 +1,84 @@
+# HA profile (M9). Overlay on the base file — it adds a second gateway and
+# an L4 nginx in front of both, and changes nothing about the workers.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d --build
+#
+# Ports after the overlay:
+#
+#   7070  nginx  -> either gateway's WebSocket   (the client entry point)
+#   7000  nginx  -> either gateway's dashboard
+#   7001         -> gateway   dashboard, directly
+#   7002         -> gateway-2 dashboard, directly
+#
+# The two direct ports exist because each gateway keeps its own in-process
+# view of its own streams (internal/dash). Through nginx you see one of
+# them; to compare, open both. See ha/nginx.conf for why that is a
+# property of the design and not a bug in the proxy config.
+
+services:
+  gateway:
+    # The base file publishes 7070/7000 on the host. Under HA nginx owns
+    # those, so this instance's dashboard moves to 7001 and its WebSocket
+    # is reachable only through the proxy — which is the point: a client
+    # that can still address one gateway directly is not testing failover.
+    ports: !override
+      - "${GATEWAY_A_DASHBOARD_PORT:-7001}:7000"
+
+  gateway-2:
+    build:
+      context: .
+      dockerfile: deploy/gateway.Dockerfile
+    ports:
+      - "${GATEWAY_B_DASHBOARD_PORT:-7002}:7000"
+    environment:
+      DASHBOARD_ADDR: ":7000"
+      MAX_SESSIONS: "${MAX_SESSIONS:-200}"
+      SOFT_SESSIONS: "${SOFT_SESSIONS:-150}"
+      BIFROST_URL: "${BIFROST_URL:-}"
+      BIFROST_MODEL: "${BIFROST_MODEL:-worker-a/whisper-1}"
+      BIFROST_FALLBACKS: "${BIFROST_FALLBACKS:-worker-b/whisper-1,worker-c/whisper-1,worker-d/whisper-1}"
+      BIFROST_FINALS: "${BIFROST_FINALS:-}"
+      # The SAME fleet as gateway-1. Both routers pick from all six
+      # workers independently, which is correct — a worker's capacity is
+      # not partitioned between gateways — and is also the honest
+      # limitation of this profile: neither gateway knows what the other
+      # has pinned, so their load estimates are each half the story.
+      WORKER_URLS: >-
+        worker-a=http://worker-a:9000,
+        worker-b=http://worker-b:9000,
+        worker-c=http://worker-c:9000,
+        worker-d=http://worker-d:9000,
+        worker-e=http://worker-e:9000
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
+    restart: "no"
+    depends_on:
+      worker-a: { condition: service_healthy }
+      worker-b: { condition: service_healthy }
+      worker-c: { condition: service_healthy }
+      worker-d: { condition: service_healthy }
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "${GATEWAY_WS_PORT:-7070}:7070"
+      - "${GATEWAY_DASHBOARD_PORT:-7000}:7000"
+    volumes:
+      - ./ha/nginx.conf:/etc/nginx/nginx.conf:ro
+    # Deliberately NOT service_healthy on the gateways. nginx must come up
+    # even when a gateway is down — that is the entire scenario this
+    # profile exists to demonstrate, and a proxy that refuses to start
+    # without all its backends would fail exactly when it is needed.
+    depends_on:
+      - gateway
+      - gateway-2
+    restart: "no"
