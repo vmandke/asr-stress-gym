@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Mic</title>
+<!--
+  A real client for this gateway: microphone in, live transcript out, over
+  the same WebSocket protocol cmd/loadgen speaks (docs/PROTOCOL.md).
+
+  It exists to be run WHILE the load generator is running. Everything else
+  in this repo measures the system from the outside — counters, p95s, a
+  dashboard. This is the one view where a human can hear themselves being
+  served by a fleet that is simultaneously carrying 30 synthetic streams,
+  and watch which worker answers, whether the session is pinned or on the
+  shared KV tier, and what happens to their own words when a worker dies.
+
+  Notes on the parts that are easy to get wrong:
+
+  - Audio is captured at EXACTLY 16 kHz mono s16le. The gateway refuses
+    anything else rather than transcoding (docs/PROTOCOL.md session.start),
+    so the AudioContext is constructed at 16 kHz and, for browsers that
+    refuse that rate, a linear resampler covers the gap.
+  - num_samples is authoritative and never inferred (invariant 1). A frame
+    whose declared count disagrees with its payload length is a protocol
+    violation that KILLS the session, not a recoverable loss — so the
+    frame builder derives both from the same array.
+  - PCM is written little-endian explicitly while the 17-byte header is
+    big-endian. Two endiannesses in one frame is not an accident: the
+    header is network order, the payload is the locked audio format.
+  - `overloaded` is not `error`. The first means the session was never
+    created and a retry is legitimate; the second is terminal. Under load
+    this is the difference the page most needs to get right.
+-->
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #21262d; --ink: #c9d1d9;
+    --dim: #6e7681; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    --accent: #58a6ff; --violet: #bc8cff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.55 var(--mono); }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 9px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 13px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .sp { flex: 1; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  main { display: grid; grid-template-columns: 1fr 320px; gap: 12px; padding: 12px; align-items: start; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px; min-width: 0; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
+       margin: 0 0 9px; font-weight: 600; }
+
+  /* transcript */
+  #transcript { min-height: 46vh; max-height: 62vh; overflow-y: auto; font-size: 16px; line-height: 1.7; }
+  .utt { margin-bottom: 10px; }
+  .utt .txt { color: var(--ink); }
+  .utt.live .txt { color: var(--dim); font-style: italic; }
+  .utt .tag { font-size: 10px; color: var(--dim); margin-right: 8px; }
+  .utt.reset { border-left: 2px solid var(--warn); padding-left: 8px; }
+  #empty { color: var(--dim); font-size: 13px; font-style: italic; }
+
+  /* level meter */
+  .meter { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 8px 0 0; }
+  .meter > i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .06s linear; }
+
+  button {
+    font: inherit; border: 1px solid var(--line); border-radius: 4px;
+    padding: 6px 11px; cursor: pointer; background: #0d1117; color: var(--ink);
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.rec { border-color: var(--bad); color: var(--bad); }
+  input {
+    font: inherit; background: #0d1117; border: 1px solid var(--line);
+    border-radius: 4px; color: var(--ink); padding: 5px 7px; width: 100%;
+  }
+  .row { display: flex; gap: 6px; align-items: center; margin-bottom: 7px; }
+  .row > input[type=number] { width: 70px; flex: none; }
+
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 12px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { margin: 0; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+  .dot.on { background: var(--ok); } .dot.err { background: var(--bad); } .dot.warn { background: var(--warn); }
+
+  .badge { font-size: 10px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 9px; color: var(--dim); }
+  .badge.kv { color: var(--violet); border-color: #3f2a63; }
+  .badge.pin { color: var(--accent); border-color: #1f4b78; }
+
+  #log { max-height: 190px; overflow-y: auto; font-size: 11px; }
+  #log div { padding: 1px 0; border-bottom: 1px solid #1a1f26; white-space: nowrap;
+             overflow: hidden; text-overflow: ellipsis; }
+  .k-error, .k-overloaded { color: var(--bad); }
+  .k-final { color: var(--ok); }
+  .k-partialreset, .k-discontinuity { color: var(--warn); }
+  .k-ack, .k-partial { color: var(--dim); }
+  .note { color: var(--dim); font-size: 11px; margin-top: 8px; }
+  .note b { color: var(--warn); font-weight: 600; }
+
+  /* voiced vs gated */
+  .split { display: flex; height: 8px; border-radius: 4px; overflow: hidden;
+           background: var(--line); margin: 9px 0 6px; }
+  .split > i { display: block; height: 100%; width: 0; transition: width .3s; }
+  .voiced { background: var(--ok); } .gated { background: #30363d; }
+  .legend { display: flex; gap: 12px; font-size: 11px; color: var(--dim); }
+  .legend b { color: var(--ink); font-weight: 600; }
+  .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+
+  /* tensor / version tables */
+  .tensors { max-height: 190px; overflow-y: auto; font-size: 11px; }
+  .tensors table { width: 100%; border-collapse: collapse; }
+  .tensors td { padding: 2px 0; border-bottom: 1px solid #1a1f26; white-space: nowrap; }
+  .tensors td.n { color: var(--dim); text-align: right; }
+  .tensors td.name { overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
+  .role-attentionK { color: var(--violet); }
+  .role-attentionV { color: var(--accent); }
+  .role-convolution, .role-bookkeeping { color: var(--dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>LIVE MIC</h1>
+  <span class="dot" id="dot"></span><span id="state">idle</span>
+  <span class="sp"></span>
+  <span id="pathBadge"></span>
+  <a href="/dashboard/">dashboard &rarr;</a>
+</header>
+
+<main>
+  <section>
+    <h2>Transcript</h2>
+    <div id="transcript"><div id="empty">Press <b>Start</b>, allow the microphone, and speak.</div></div>
+    <div class="meter"><i id="level"></i></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btn">Start</button>
+      <button id="clear">Clear</button>
+      <span id="hint" class="note" style="margin:0"></span>
+    </div>
+  </section>
+
+  <div style="display:grid;gap:12px;min-width:0">
+    <section>
+      <h2>This session</h2>
+      <dl class="kv">
+        <dt>session</dt><dd id="sid">&mdash;</dd>
+        <dt>served by</dt><dd id="worker">&mdash;</dd>
+        <dt>path</dt><dd id="path">&mdash;</dd>
+        <dt>frames sent</dt><dd id="frames">0</dd>
+        <dt>acked seq</dt><dd id="acked">&mdash;</dd>
+        <dt>partials</dt><dd id="nPartial">0</dd>
+        <dt>finals</dt><dd id="nFinal">0</dd>
+        <dt>failovers</dt><dd id="nFailover">0</dd>
+        <dt>ws backlog</dt><dd id="backlog">0 B</dd>
+      </dl>
+    </section>
+
+    <section>
+      <h2>Chunking &amp; silence</h2>
+      <dl class="kv">
+        <dt>frames in</dt><dd id="cFrames">&mdash;</dd>
+        <dt>audio captured</dt><dd id="cAudio">&mdash;</dd>
+        <dt>chunks dispatched</dt><dd id="cChunks">&mdash;</dd>
+        <dt>avg chunk</dt><dd id="cChunkMs">&mdash;</dd>
+      </dl>
+      <div class="split" id="vadBar" title="voiced vs gated">
+        <i class="voiced"></i><i class="gated"></i>
+      </div>
+      <div class="legend">
+        <span><i class="sw voiced"></i>voiced <b id="cVoiced">0</b></span>
+        <span><i class="sw gated"></i>silence dropped <b id="cGated">0</b></span>
+      </div>
+      <p class="note">Frames arrive every 20&nbsp;ms. The VAD gates silence
+      <b>before</b> chunking, so gated frames are still journalled (a replay
+      must reproduce them) but never become a backend call. Calls avoided so
+      far: <b id="cAvoided">0</b>.</p>
+    </section>
+
+    <section>
+      <h2>KV cache</h2>
+      <dl class="kv">
+        <dt>family</dt><dd id="kFamily">&mdash;</dd>
+        <dt>tier</dt><dd id="kTier">&mdash;</dd>
+        <dt>tensors</dt><dd id="kCount">&mdash;</dd>
+        <dt>attention K/V</dt><dd id="kKV">&mdash;</dd>
+        <dt>per session</dt><dd id="kTotal">&mdash;</dd>
+        <dt>resident now</dt><dd id="kResident">&mdash;</dd>
+      </dl>
+      <div id="kTensors" class="tensors"></div>
+      <h2 style="margin-top:12px">Your versions in the tier</h2>
+      <div id="kKeys" class="tensors"><span class="note">&mdash;</span></div>
+      <p class="note">One immutable version per chunk. A version is retired
+      once its successor is durable, so you should see one or two at a time
+      &mdash; not a growing list.</p>
+    </section>
+
+    <section>
+      <h2>Background load</h2>
+      <div class="row">
+        <input type="number" id="nStreams" min="1" max="200" value="30">
+        <button id="loadStart">Start</button>
+        <button id="loadStop">Stop</button>
+      </div>
+      <dl class="kv">
+        <dt>generator</dt><dd id="loadState">&mdash;</dd>
+        <dt>other streams</dt><dd id="otherStreams">&mdash;</dd>
+      </dl>
+      <p class="note">Your microphone session is admitted through the same
+      controller as the synthetic ones. If the gateway is at its ceiling you
+      will get <b>overloaded</b> &mdash; retryable, and not the same thing as an error.</p>
+    </section>
+
+    <section>
+      <h2>Gateway settings</h2>
+      <div class="row"><input id="wsurl" spellcheck="false"></div>
+      <p class="note">Changing this reconnects on the next Start.</p>
+    </section>
+
+    <section>
+      <h2>Events</h2>
+      <div id="log"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// ---- protocol constants, from docs/PROTOCOL.md ----------------------
+const SAMPLE_RATE   = 16000;         // locked; the gateway refuses anything else
+const FRAME_MS      = 20;            // nominal_frame_ms
+const FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000;  // 320
+const HEADER        = 17;            // type(1) + seq(8) + capture_ms(4) + num_samples(4)
+const TYPE_AUDIO    = 1, TYPE_CONTROL = 2;
+
+// ---- frame encoding -------------------------------------------------
+//
+// Header is big-endian (network order); the PCM payload is s16 LITTLE
+// endian, written explicitly rather than by reinterpreting an Int16Array,
+// so the frame is correct on a big-endian client too.
+function encodeAudio(n, captureMs, samples) {
+  const buf = new ArrayBuffer(HEADER + samples.length * 2);
+  const dv = new DataView(buf);
+  dv.setUint8(0, TYPE_AUDIO);
+  dv.setBigUint64(1, BigInt(n));
+  dv.setUint32(9, captureMs);
+  dv.setUint32(13, samples.length);      // authoritative, same array as the payload
+  for (let i = 0; i < samples.length; i++) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    dv.setInt16(HEADER + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buf;
+}
+
+function encodeControl(n, obj) {
+  const body = new TextEncoder().encode(JSON.stringify(obj));
+  const buf = new ArrayBuffer(HEADER + body.length);
+  const dv = new DataView(buf);
+  dv.setUint8(0, TYPE_CONTROL);
+  dv.setBigUint64(1, BigInt(n));
+  dv.setUint32(9, 0);
+  dv.setUint32(13, 0);                   // control frames carry no samples
+  new Uint8Array(buf, HEADER).set(body);
+  return buf;
+}
+
+// ---- end protocol block (scripts/test_mic_protocol.mjs imports the above) ----
+
+const $ = id => document.getElementById(id);
+const defaultWs = () => `ws://${location.hostname || "localhost"}:7070/ws`;
+$("wsurl").value = localStorage.getItem("mic.ws") || defaultWs();
+$("wsurl").addEventListener("change", () => localStorage.setItem("mic.ws", $("wsurl").value.trim()));
+
+let ws = null, audioCtx = null, micStream = null, workletNode = null, srcNode = null;
+let running = false, seq = 0, startedAt = 0, sessionId = null;
+let pending = new Float32Array(0);       // carry between worklet blocks
+let stats = { frames: 0, partials: 0, finals: 0, failovers: 0, acked: null };
+let liveEl = null, pollTimer = null, kvTimer = null, myCompatKey = null;
+
+// ---- UI -------------------------------------------------------------
+function setState(text, kind) {
+  $("state").textContent = text;
+  $("dot").className = "dot" + (kind ? " " + kind : "");
+}
+
+function log(type, detail) {
+  const d = document.createElement("div");
+  d.className = "k-" + type.replace(/\./g, "");
+  const t = new Date().toLocaleTimeString("en-GB", { hour12: false });
+  d.textContent = `${t}  ${type}${detail ? "  " + detail : ""}`;
+  $("log").prepend(d);
+  while ($("log").childElementCount > 120) $("log").lastElementChild.remove();
+}
+
+function refresh() {
+  $("frames").textContent = stats.frames.toLocaleString();
+  $("nPartial").textContent = stats.partials;
+  $("nFinal").textContent = stats.finals;
+  $("nFailover").textContent = stats.failovers;
+  $("acked").textContent = stats.acked === null ? "—" : stats.acked;
+  $("backlog").textContent = ws ? `${(ws.bufferedAmount / 1024).toFixed(1)} KiB` : "0 B";
+}
+
+function ensureLive() {
+  $("empty")?.remove();
+  if (!liveEl) {
+    liveEl = document.createElement("div");
+    liveEl.className = "utt live";
+    liveEl.innerHTML = '<span class="tag">live</span><span class="txt"></span>';
+    $("transcript").append(liveEl);
+  }
+  return liveEl.querySelector(".txt");
+}
+
+function commitFinal(text) {
+  $("empty")?.remove();
+  const el = liveEl || document.createElement("div");
+  el.className = "utt";
+  el.innerHTML = '<span class="tag">final</span><span class="txt"></span>';
+  el.querySelector(".txt").textContent = text;
+  if (!liveEl) $("transcript").append(el);
+  liveEl = null;
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+}
+
+// ---- the session ----------------------------------------------------
+async function start() {
+  if (running) return stop();
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    $("hint").textContent = "Microphone needs a secure context — use http://localhost, not an IP.";
+    return;
+  }
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    $("hint").textContent = "Microphone denied: " + e.message;
+    return;
+  }
+
+  // Ask for 16 kHz directly so the browser resamples in its own audio
+  // graph. Some browsers ignore the hint, so the tap resamples too — the
+  // gateway rejects any rate but 16000 rather than transcoding.
+  try { audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE }); }
+  catch { audioCtx = new AudioContext(); }
+  await audioCtx.resume();
+  const ratio = audioCtx.sampleRate / SAMPLE_RATE;
+  if (Math.abs(ratio - 1) > 0.001) {
+    $("hint").textContent = `browser gave ${audioCtx.sampleRate} Hz; resampling to 16000`;
+  } else {
+    $("hint").textContent = "";
+  }
+
+  const url = $("wsurl").value.trim() || defaultWs();
+  setState("connecting", "warn");
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = async () => {
+    seq = 0; startedAt = performance.now(); sessionId = null;
+    stats = { frames: 0, partials: 0, finals: 0, failovers: 0, acked: null };
+    pending = new Float32Array(0);
+
+    ws.send(encodeControl(seq++, {
+      type: "session.start",
+      mode: "online",
+      sample_rate_hz: SAMPLE_RATE,
+      encoding: "pcm_s16le",
+      channels: 1,
+      nominal_frame_ms: FRAME_MS,
+    }));
+    log("session.start", "online 16000 pcm_s16le");
+
+    await startTap(ratio);
+    running = true;
+    $("btn").textContent = "Stop";
+    $("btn").classList.add("rec");
+    setState("streaming", "on");
+    pollTimer = setInterval(pollSession, 1000);
+    kvTimer = setInterval(pollKV, 1500);
+  };
+
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.session_id && !sessionId) { sessionId = m.session_id; $("sid").textContent = sessionId; }
+
+    switch (m.type) {
+      case "partial":
+        stats.partials++; ensureLive().textContent = m.text || "";
+        $("transcript").scrollTop = $("transcript").scrollHeight;
+        break;
+      case "final":
+        stats.finals++; commitFinal(m.text || ""); log("final", `"${(m.text || "").slice(0, 44)}"`);
+        break;
+      case "partial.reset":
+        stats.failovers++;
+        if (liveEl) { liveEl.classList.add("reset"); liveEl.querySelector(".txt").textContent = ""; }
+        log("partial.reset", `failover_epoch=${m.failover_epoch} — displayed text discarded`);
+        break;
+      case "ack": stats.acked = m.highest_contiguous_seq; break;
+      case "speech.start": log("speech.start", ""); break;
+      case "discontinuity": log("discontinuity", `${m.seq_start}..${m.seq_end}`); break;
+      case "overloaded":
+        // NOT an error: the session was never created, and retrying is
+        // legitimate. Under background load this is the expected refusal.
+        log("overloaded", `${m.reason} — retry in ${m.retry_after_ms}ms`);
+        $("hint").textContent = `gateway refused the session: ${m.reason}. Retryable.`;
+        setState("overloaded", "warn");
+        stop();
+        break;
+      case "error":
+        log("error", m.reason);
+        $("hint").textContent = "session error: " + m.reason;
+        setState("error", "err");
+        stop();
+        break;
+    }
+    refresh();
+  };
+
+  ws.onerror = () => { setState("ws error", "err"); log("error", "websocket failed — is the gateway up?"); };
+  ws.onclose = () => { if (running) stop(); setState("closed"); };
+}
+
+// The audio tap: one AudioWorklet posting raw blocks, reframed here into
+// exact 20ms frames. Kept in a Blob so this page stays a single file.
+async function startTap(ratio) {
+  const src = `
+    class PCMTap extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (ch && ch.length) this.port.postMessage(new Float32Array(ch));
+        return true;
+      }
+    }
+    registerProcessor('pcm-tap', PCMTap);`;
+  const blobUrl = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+  await audioCtx.audioWorklet.addModule(blobUrl);
+  URL.revokeObjectURL(blobUrl);
+
+  srcNode = audioCtx.createMediaStreamSource(micStream);
+  workletNode = new AudioWorkletNode(audioCtx, "pcm-tap");
+  workletNode.port.onmessage = e => onBlock(e.data, ratio);
+
+  // Through a muted gain node to the destination: an AudioWorkletNode that
+  // reaches no sink is not guaranteed to be pulled, and connecting it
+  // audibly would feed the microphone straight back to the speakers.
+  const mute = audioCtx.createGain();
+  mute.gain.value = 0;
+  srcNode.connect(workletNode);
+  workletNode.connect(mute);
+  mute.connect(audioCtx.destination);
+}
+
+function onBlock(block, ratio) {
+  if (!running && stats.frames > 0) return;
+
+  if (Math.abs(ratio - 1) > 0.001) block = resample(block, ratio);
+
+  // Level meter, before framing so it moves even on a partial frame.
+  let peak = 0;
+  for (let i = 0; i < block.length; i++) { const a = Math.abs(block[i]); if (a > peak) peak = a; }
+  $("level").style.width = Math.min(100, peak * 140).toFixed(0) + "%";
+
+  const merged = new Float32Array(pending.length + block.length);
+  merged.set(pending); merged.set(block, pending.length);
+
+  let off = 0;
+  while (merged.length - off >= FRAME_SAMPLES) {
+    const frame = merged.subarray(off, off + FRAME_SAMPLES);
+    off += FRAME_SAMPLES;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(encodeAudio(seq++, Math.round(performance.now() - startedAt), frame));
+      stats.frames++;
+    }
+  }
+  pending = merged.slice(off);
+  if (stats.frames % 10 === 0) refresh();
+}
+
+// Linear interpolation. Only reached when the browser refused a 16 kHz
+// context; the quality difference against the browser's own resampler is
+// not audible at speech bandwidth and this keeps the format guaranteed.
+function resample(input, ratio) {
+  const out = new Float32Array(Math.floor(input.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const pos = i * ratio, j = Math.floor(pos), frac = pos - j;
+    out[i] = input[j] + (input[Math.min(j + 1, input.length - 1)] - input[j]) * frac;
+  }
+  return out;
+}
+
+function stop() {
+  running = false;
+  $("btn").textContent = "Start";
+  $("btn").classList.remove("rec");
+  $("level").style.width = "0%";
+  clearInterval(pollTimer); pollTimer = null;
+  clearInterval(kvTimer); kvTimer = null;
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      // Graceful finalization: flush pending audio and emit the final for
+      // the open utterance (docs/PROTOCOL.md session.end).
+      ws.send(encodeControl(seq++, { type: "session.end" }));
+      log("session.end", "");
+      setTimeout(() => { try { ws.close(); } catch {} }, 700);
+    } catch {}
+  }
+  workletNode?.port && (workletNode.port.onmessage = null);
+  try { srcNode?.disconnect(); workletNode?.disconnect(); } catch {}
+  micStream?.getTracks().forEach(t => t.stop());
+  audioCtx?.close().catch(() => {});
+  micStream = null; audioCtx = null; workletNode = null; srcNode = null;
+  setState("idle");
+}
+
+// ---- what the fleet says about this session -------------------------
+async function pollSession() {
+  try {
+    const r = await fetch("/api/streams");
+    const d = await r.json();
+    const mine = (d.streams || []).find(s => s.id === sessionId);
+    const others = (d.streams || []).filter(s => s.id !== sessionId && s.state !== "ENDED").length;
+    $("otherStreams").textContent = others;
+    if (mine) {
+      $("worker").textContent = mine.worker || "—";
+      // A "kv:"-prefixed handle means the session's state lives in the
+      // family's shared tier rather than inside that worker, so any member
+      // of the pool could serve the next chunk (docs/STATELESS-KVTIER.md).
+      const stateless = (mine.handle || "").startsWith("kv:");
+      $("path").textContent = stateless ? "shared KV tier" : "pinned";
+      $("pathBadge").innerHTML = stateless
+        ? '<span class="badge kv">stateless · bifrost pool</span>'
+        : '<span class="badge pin">pinned worker</span>';
+      if (mine.failovers > stats.failovers) stats.failovers = mine.failovers;
+      renderChunking(mine);
+      myCompatKey = mine.compat_key || myCompatKey;
+    }
+  } catch {}
+  refresh();
+}
+
+const bytes = n =>
+  n >= 1 << 20 ? (n / (1 << 20)).toFixed(2) + " MiB"
+  : n >= 1024  ? (n / 1024).toFixed(1) + " KiB"
+  : n + " B";
+
+// Chunking and VAD gating, straight from the gateway's own per-stream
+// counters. Frames arrive every 20ms; the VAD decides which of them reach
+// the chunker, and the chunker accumulates by DURATION (invariant 2), so
+// "avg chunk" is derived from bytes rather than assumed to be 160ms.
+function renderChunking(s) {
+  const framesIn = s.frames_in || 0, voiced = s.frames_voiced || 0, gated = s.frames_gated || 0;
+  $("cFrames").textContent = framesIn.toLocaleString();
+  $("cAudio").textContent = ((s.audio_ms_in || 0) / 1000).toFixed(1) + " s";
+  $("cChunks").textContent = (s.chunks_out || 0).toLocaleString();
+
+  // 16 kHz mono s16le = 32 bytes per millisecond.
+  const chunkMs = s.chunks_out ? (s.chunk_bytes_out / s.chunks_out) / 32 : 0;
+  $("cChunkMs").textContent = chunkMs ? chunkMs.toFixed(0) + " ms" : "—";
+
+  const total = voiced + gated || 1;
+  $("vadBar").querySelector(".voiced").style.width = (voiced / total * 100) + "%";
+  $("vadBar").querySelector(".gated").style.width = (gated / total * 100) + "%";
+  $("cVoiced").textContent = `${voiced.toLocaleString()} (${(voiced / total * 100).toFixed(0)}%)`;
+  $("cGated").textContent = `${gated.toLocaleString()} (${(gated / total * 100).toFixed(0)}%)`;
+  // Every 20ms frame the VAD drops is audio the chunker never accumulates,
+  // so the saving is in whole backend calls, not in bytes.
+  $("cAvoided").textContent = chunkMs ? Math.floor(gated * 20 / chunkMs).toLocaleString() : "0";
+}
+
+// What the cache actually holds. Read from the worker's /v1/kv/layout,
+// which derives it from the ONNX graph — so this cannot claim a tensor the
+// model does not have.
+async function pollKV() {
+  if (!sessionId) return;
+  try {
+    const d = await (await fetch(`/api/kv?session=${encodeURIComponent(sessionId)}`)).json();
+    if (!d.available) return;
+    // Pick the pool serving this session; fall back to the first that has
+    // a layout at all so the panel is informative before a session starts.
+    const pool = d.pools.find(p => p.compat_key === myCompatKey)
+              || d.pools.find(p => p.layout) || d.pools[0];
+    if (!pool) return;
+    const L = pool.layout;
+    $("kTier").textContent = pool.tier || "none";
+    if (!L || !L.supported) {
+      $("kFamily").textContent = "not serializable";
+      $("kTensors").innerHTML = '<span class="note">this model exposes no KV state</span>';
+      return;
+    }
+    $("kFamily").textContent = L.model_family || "—";
+    $("kCount").textContent = `${L.tensor_count} (${L.dtype})`;
+    $("kKV").textContent = bytes(L.kv_bytes);
+    $("kTotal").textContent = bytes(L.total_bytes);
+    $("kResident").textContent =
+      `${bytes(L.live_state_bytes || 0)} / ${L.active_sessions || 0} sess`;
+
+    $("kTensors").innerHTML = "<table>" + L.tensors.map(t =>
+      `<tr><td class="name role-${t.role.replace(/\s/g, "")}" title="${t.name} &larr; ${t.feeds_back_from || "?"}">${t.name}</td>` +
+      `<td class="n">[${t.shape.join(",")}]</td><td class="n">${bytes(t.bytes)}</td></tr>`).join("") + "</table>";
+
+    const keys = (pool.keys && pool.keys.keys) || [];
+    $("kKeys").innerHTML = keys.length
+      ? "<table>" + keys.map(k =>
+          `<tr><td class="name">${k.key.split(":").slice(-1)[0]}</td>` +
+          `<td class="n">${bytes(k.bytes)}</td><td class="n">${k.age_ms} ms</td></tr>`).join("") + "</table>"
+      : '<span class="note">none resident — this session is on the pinned path, '
+        + 'or its versions have already been retired</span>';
+  } catch {}
+}
+
+async function pollLoad() {
+  try {
+    const d = await (await fetch("/api/load")).json();
+    if (!d.available) { $("loadState").textContent = "not configured"; return; }
+    const st = d.status || {};
+    $("loadState").textContent = st.running ? `running ${st.streams ?? ""}`.trim() : "stopped";
+  } catch { $("loadState").textContent = "unreachable"; }
+}
+
+$("btn").onclick = start;
+$("clear").onclick = () => {
+  $("transcript").innerHTML = '<div id="empty">Cleared.</div>';
+  liveEl = null;
+};
+$("loadStart").onclick = async () => {
+  const n = Math.max(1, Math.min(200, +$("nStreams").value || 1));
+  await fetch(`/api/load/${n}`, { method: "POST" }).catch(() => {});
+  log("load", `start ${n} streams`); setTimeout(pollLoad, 400);
+};
+$("loadStop").onclick = async () => {
+  await fetch("/api/load/stop", { method: "POST" }).catch(() => {});
+  log("load", "stop"); setTimeout(pollLoad, 400);
+};
+
+pollLoad();
+setInterval(pollLoad, 3000);
+pollKV();   // show the cache layout before a session even starts
+refresh();
+</script>
+</body>
+</html>

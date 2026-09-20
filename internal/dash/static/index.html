@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASR Stress Gym</title>
+<!--
+  One file. No build step, no framework, no npm, no CDN.
+
+  That is a constraint, not an aesthetic: this page is served from a Go
+  binary's embedded FS inside a container that may have no internet, and
+  `docker compose up` has to produce a working dashboard on a reviewer's
+  machine. Every dependency is a way for that to fail on someone else's
+  laptop. Charts are plain canvas for the same reason.
+
+  LAYOUT RULE: three things visible at rest — the fleet, one chart, the
+  streams. Everything else is one click away. An earlier revision showed
+  topology + traffic + latency + a 7x4 grid of node sparklines + streams +
+  inspector simultaneously, which meant a reviewer had to work out what to
+  look at before they could look at anything. Detail now lives where the
+  question is asked: node internals on the node, stream internals in the
+  inspector, and the three charts share one pane behind tabs.
+-->
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #21262d; --ink: #c9d1d9;
+    --dim: #6e7681; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    --accent: #58a6ff; --violet: #bc8cff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.55 var(--mono); }
+
+  header {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 9px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  h1 { font-size: 13px; margin: 0; font-weight: 600; letter-spacing: .08em; }
+  .stat { color: var(--dim); font-size: 12px; }
+  .stat b { color: var(--ink); font-weight: 600; }
+  .stat.bad b { color: var(--bad); }
+  #conn { margin-left: auto; }
+  #conn.live { color: var(--ok); } #conn.down { color: var(--bad); }
+
+  .wrap { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 1150px) { .row2 { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; min-width: 0; }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--dim);
+    margin: 0 0 9px; font-weight: 600; display: flex; align-items: center; gap: 10px;
+  }
+  h2 .sub { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: auto; }
+
+  /* --- fleet --- */
+  .nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+  .node {
+    border: 1px solid var(--line); border-left: 3px solid var(--dim); border-radius: 4px;
+    padding: 7px 9px; cursor: pointer; background: #0d1117;
+  }
+  .node:hover { border-color: var(--accent); }
+  .node.healthy { border-left-color: var(--ok); }
+  .node.degraded { border-left-color: var(--warn); }
+  .node.ejected, .node.down { border-left-color: var(--bad); }
+  .node.draining { border-left-color: var(--violet); }
+  .node .top { display: flex; justify-content: space-between; align-items: baseline; }
+  .node .id { font-weight: 600; }
+  .node .model { color: var(--dim); font-size: 11px; margin: 1px 0 5px; }
+  .node .badges { display: flex; gap: 4px; margin-bottom: 5px; flex-wrap: wrap; }
+  .badge { font-size: 9.5px; padding: 0 4px; border-radius: 3px; border: 1px solid var(--line); color: var(--dim); }
+  .badge.stream { color: var(--accent); border-color: #1f4b78; }
+  .badge.batch { color: var(--violet); border-color: #43346b; }
+  .badge.cache { color: var(--ok); border-color: #1d572b; }
+  .node .nums { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); }
+  .node .nums b { color: var(--ink); font-weight: 600; }
+  .node .why { font-size: 10.5px; margin-top: 4px; }
+  .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .bar > i.warn { background: var(--warn); } .bar > i.bad { background: var(--bad); }
+
+  /* --- controls --- */
+  .ctl { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+  .ctl button, .tabs button {
+    background: #0d1117; border: 1px solid var(--line); color: var(--ink);
+    font: inherit; font-size: 12px; padding: 2px 9px; border-radius: 4px; cursor: pointer;
+  }
+  .ctl button:hover, .tabs button:hover { border-color: var(--accent); color: var(--accent); }
+  .ctl button.on { border-color: var(--ok); color: var(--ok); }
+  .ctl button:disabled { opacity: .4; cursor: not-allowed; }
+  .tabs button.on { border-color: var(--accent); color: var(--accent); }
+
+  #menu {
+    position: fixed; z-index: 20; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px; display: none; box-shadow: 0 8px 28px #0009; min-width: 210px;
+  }
+  #menu h3 { margin: 2px 6px 6px; font-size: 11px; color: var(--dim); font-weight: 600; }
+  #menu button { display: block; width: 100%; text-align: left; background: none; border: 0;
+    color: var(--ink); font: inherit; padding: 5px 8px; border-radius: 4px; cursor: pointer; }
+  #menu button:hover { background: #21262d; }
+  #menu button small { color: var(--dim); float: right; margin-left: 14px; }
+
+  canvas { width: 100%; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; margin-top: 6px; color: var(--dim); }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
+
+  /* --- streams --- */
+  .scroll { max-height: 300px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  th { text-align: left; color: var(--dim); font-weight: 600; position: sticky; top: 0;
+       background: var(--panel); padding: 3px 6px; border-bottom: 1px solid var(--line); }
+  td { padding: 3px 6px; border-bottom: 1px solid #1c2128; white-space: nowrap; }
+  tr.sel td { background: #1b2430; }
+  tbody tr { cursor: pointer; }
+  .chip { padding: 0 5px; border-radius: 3px; font-size: 10px; border: 1px solid var(--line); }
+  .chip.SPEECH { color: var(--ok); border-color: var(--ok); }
+  .chip.LISTENING { color: var(--dim); }
+  .chip.FAILING_OVER { color: var(--bad); border-color: var(--bad); }
+  .chip.ENDED { color: var(--dim); opacity: .6; }
+  .txt { color: var(--dim); max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+
+  /* --- inspector --- */
+  .flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  .box { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; background: #0d1117; }
+  .box h4 { margin: 0 0 3px; font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); font-weight: 600; }
+  .box .v { font-size: 15px; font-weight: 600; }
+  .box .d { font-size: 10.5px; color: var(--dim); }
+  .box.hot { border-left: 2px solid var(--bad); }
+  .box.warm { border-left: 2px solid var(--warn); }
+  .box.cold { border-left: 2px solid var(--accent); }
+  #log { max-height: 250px; overflow: auto; font-size: 11.5px; }
+  #log div { white-space: pre-wrap; padding: 1px 0; }
+  .t { color: var(--dim); }
+  .k-partial { color: var(--dim); }
+  .k-final { color: var(--ok); }
+  .k-error { color: var(--bad); }
+  .k-overloaded, .k-discontinuity { color: var(--warn); }
+  .k-chaos { color: var(--violet); }
+  .k-failover\.same { color: var(--warn); }
+  .k-failover\.cross, .k-partial\.reset { color: var(--bad); }
+  .k-speech\.start, .k-session\.start, .k-session\.end { color: var(--accent); }
+  .empty { color: var(--dim); padding: 14px 4px; }
+  .note { color: var(--dim); font-size: 11px; margin-top: 8px; }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ASR STRESS GYM</h1>
+  <span class="stat">streams <b id="s-streams">0</b></span>
+  <span class="stat">push p50 <b id="s-p50">–</b></span>
+  <span class="stat">final p50 <b id="s-fp50">–</b></span>
+  <span class="stat">failovers <b id="s-fo">0</b></span>
+  <span class="stat" id="s-dup-wrap">dup finals <b id="s-dup">0</b></span>
+  <span id="conn" class="stat down">connecting…</span>
+  <a class="stat" href="/dashboard/mic.html"
+     title="Speak into the fleet while the load runs">🎤 live mic</a>
+</header>
+
+<div class="wrap">
+
+  <section>
+    <h2>Fleet
+      <span class="ctl">
+        <span class="stat">load</span>
+        <button data-load="0">stop</button>
+        <button data-load="5">5</button>
+        <button data-load="20">20</button>
+        <button data-load="50">50</button>
+        <button data-load="100">100</button>
+      </span>
+      <span class="sub" id="load-state">–</span>
+    </h2>
+    <div class="nodes" id="nodes"></div>
+    <div class="note" id="fleet-note"></div>
+    <div class="note" id="bifrost-note"></div>
+  </section>
+
+  <section>
+    <h2>
+      <span class="tabs">
+        <button data-tab="traffic" class="on">traffic</button>
+        <button data-tab="latency">latency</button>
+        <button data-tab="nodes">resources</button>
+      </span>
+      <span class="sub" id="chart-note"></span>
+    </h2>
+    <canvas id="chart" height="170"></canvas>
+    <div id="chart-legend" class="legend"></div>
+  </section>
+
+  <div class="row2">
+    <section>
+      <h2>Streams <span class="sub" id="stream-count"></span></h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>id</th><th>mode</th><th>worker</th><th>utt</th><th>rev</th><th>fo</th><th>state</th><th>text</th></tr></thead>
+          <tbody id="streams"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Inspector <span class="sub" id="insp-id">click a stream</span></h2>
+      <div id="flow" class="flow hide"></div>
+      <div id="log"><div class="empty">Click a stream to see where its audio goes,
+        which worker it is pinned to, and what state exists where.</div></div>
+    </section>
+  </div>
+</div>
+
+<div id="menu"></div>
+
+<script>
+"use strict";
+
+const S = {
+  snap: null, nodes: { order: [], series: {}, latest: [] },
+  lat: [], traffic: [], marks: [], prevPushes: null,
+  selStream: null, log: [], tab: "traffic",
+};
+const WINDOW_MS = 4 * 60 * 1000;
+
+const $ = (id) => document.getElementById(id);
+const fmtMs = (v) => (v || v === 0) ? (v < 10 ? v.toFixed(1) : Math.round(v)) + "ms" : "–";
+const fmtBytes = (b) => {
+  if (b === null || b === undefined) return "–";
+  const u = ["B", "K", "M", "G"]; let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 && i > 0 ? 1 : 0) + u[i];
+};
+const clock = (ms) => new Date(ms).toISOString().substr(11, 12);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const COLORS = ["#58a6ff", "#3fb950", "#d29922", "#bc8cff", "#f85149", "#39c5cf", "#ff7b72"];
+const colorFor = (() => {
+  const a = {};
+  return (id) => (id in a ? a[id] : (a[id] = COLORS[Object.keys(a).length % COLORS.length]));
+})();
+
+// ---------------------------------------------------------------------
+// SSE. EventSource reconnects and resends Last-Event-ID by itself, which
+// is the reason this feed is SSE and not a second WebSocket — there is no
+// reconnect logic here at all. See internal/dash/sse.go.
+// ---------------------------------------------------------------------
+function connect() {
+  const es = new EventSource("/api/events");
+  es.addEventListener("open", () => { $("conn").className = "stat live"; $("conn").textContent = "● live"; });
+  es.addEventListener("error", () => { $("conn").className = "stat down"; $("conn").textContent = "● reconnecting…"; });
+  es.addEventListener("snapshot", (e) => onSnapshot(JSON.parse(e.data)));
+  es.addEventListener("event", (e) => onEvent(JSON.parse(e.data)));
+}
+
+function onSnapshot(s) {
+  S.snap = s;
+  const now = s.at_ms;
+
+  if (s.push_latency.count > 0) {
+    S.lat.push({ t: now, p50: s.push_latency.p50_ms, p95: s.push_latency.p95_ms, p99: s.push_latency.p99_ms });
+    while (S.lat.length && now - S.lat[0].t > WINDOW_MS) S.lat.shift();
+  }
+  while (S.marks.length && now - S.marks[0].t > WINDOW_MS) S.marks.shift();
+
+  // Backend calls/sec per worker, differenced from cumulative counters.
+  // Differenced here rather than server-side because the right window is
+  // "whatever this viewer's snapshot interval actually was", including
+  // the gaps when the tab was backgrounded.
+  if (S.prevPushes && now > S.prevPushes.t) {
+    const dt = (now - S.prevPushes.t) / 1000, rates = {};
+    for (const [w, total] of Object.entries(s.worker_pushes || {})) {
+      rates[w] = Math.max(0, (total - (S.prevPushes.v[w] || 0)) / dt);
+    }
+    S.traffic.push({ t: now, rates });
+    while (S.traffic.length && now - S.traffic[0].t > WINDOW_MS) S.traffic.shift();
+  }
+  S.prevPushes = { t: now, v: Object.assign({}, s.worker_pushes || {}) };
+
+  $("s-streams").textContent = s.streams_total;
+  $("s-p50").textContent = fmtMs(s.push_latency.p50_ms);
+  $("s-fp50").textContent = fmtMs(s.final_latency.p50_ms);
+  $("s-fo").textContent = s.metrics.failover_total;
+  $("s-dup").textContent = s.metrics.duplicate_finals_total;
+  // The one counter that must stay zero. Turning it red is the cheapest
+  // possible way to notice that it did not.
+  $("s-dup-wrap").className = "stat" + (s.metrics.duplicate_finals_total > 0 ? " bad" : "");
+
+  renderFleet();
+  renderBifrost();
+  renderStreams();
+  drawChart();
+}
+
+// Bifrost's own view, scraped from its /metrics. The number that matters
+// is fallback_index: index 0 means the primary served and Bifrost did
+// nothing but add a hop; index >= 1 means a provider failed and the chain
+// actually saved the request. It is the only direct evidence that the one
+// Bifrost feature doing real work here is doing it.
+function renderBifrost() {
+  const b = (S.snap && S.snap.bifrost) || {};
+  const el = $("bifrost-note");
+  if (!b.available) {
+    el.innerHTML = b.error
+      ? `Bifrost: <span style="color:var(--warn)">unreachable — ${esc(b.error)}</span>`
+      : "Bifrost: not configured (offline finals take the direct path).";
+    return;
+  }
+  const idx = b.by_fallback_index || {};
+  const depths = Object.keys(idx).sort();
+  const spread = depths.map(d =>
+    `<span style="color:${d === "0" ? "var(--dim)" : "var(--ok)"}">idx${d}:${idx[d]}</span>`).join(" ");
+  const providers = (b.providers || []).map(p => {
+    const dead = p.has_up_info && !p.up;
+    return `<span style="color:${dead ? "var(--bad)" : "var(--dim)"}">` +
+      `${p.name.replace("worker-", "")} ${p.mean_ms ? p.mean_ms.toFixed(0) + "ms" : "–"}` +
+      `${p.errors ? " e" + p.errors : ""}</span>`;
+  }).join(" · ");
+
+  el.innerHTML =
+    `<b>Bifrost</b> (offline finals only): ${b.total_success} ok / ${b.total_error} err · ` +
+    `served at ${spread} · <b style="color:${b.saved_by_fallback ? "var(--ok)" : "var(--dim)"}">` +
+    `${b.saved_by_fallback} saved by fallback</b><br>` +
+    `<span style="font-size:10.5px">its own provider view (independent of the router — disagreement means gray failure): ${providers}</span>`;
+}
+
+function onEvent(ev) {
+  if (ev.kind === "chaos" || ev.kind.startsWith("failover") || ev.kind === "error") {
+    S.marks.push({ t: ev.at_ms, kind: ev.kind });
+  }
+  if (S.selStream && ev.session === S.selStream) { S.log.push(ev); renderLog(); }
+}
+
+// ---------------------------------------------------------------------
+// Fleet. Each node answers, at a glance: what is it serving, can it take
+// streaming traffic, how loaded is it, and — if it is out of rotation —
+// WHY, in the terms the rule actually uses.
+// ---------------------------------------------------------------------
+const nodeByName = (id) => (S.nodes.latest || []).find((n) => n.node === id);
+
+function rate(id) {
+  const last = S.traffic[S.traffic.length - 1];
+  return last ? (last.rates[id] || 0).toFixed(1) : "–";
+}
+function ejectRatio(w) {
+  const base = S.snap && S.snap.fleet.cluster_p95_ms;
+  return (!base || !w.latency_p95_ms) ? 0 : w.latency_p95_ms / base;
+}
+
+function renderFleet() {
+  if (!S.snap) return;
+  const f = S.snap.fleet, workers = f.workers || [];
+  const el = $("nodes");
+  el.innerHTML = "";
+
+  for (const w of workers) {
+    const n = nodeByName(w.id) || {};
+    const down = n.ok === false;
+    const r = ejectRatio(w), limit = f.eject_at_multiple || 3;
+    const d = document.createElement("div");
+    d.className = "node " + (down ? "down" : w.status) + (w.draining ? " draining" : "");
+
+    // Why this node is out of rotation, stated in the rule's own terms.
+    // "ejected" is a verdict; this is the evidence.
+    let why = "";
+    if (down) why = `<span style="color:var(--bad)">process is not answering</span>`;
+    else if (w.draining) why = `<span style="color:var(--violet)">drained — no new sessions</span>`;
+    else if (!w.streaming) why = `<span style="color:var(--dim)">batch only — online never routes here</span>`;
+    else if (w.status === "ejected") why = `<span style="color:var(--bad)">ejected: p95 ${r.toFixed(1)}× cluster (limit ${limit}×)</span>`;
+    else if (r >= limit * 0.66) why = `<span style="color:var(--warn)">p95 ${r.toFixed(1)}× cluster, limit ${limit}×</span>`;
+
+    const pct = n.mem_pct_limit;
+    const memCls = pct == null ? "" : (pct > 90 ? "bad" : pct > 75 ? "warn" : "");
+
+    d.innerHTML =
+      `<div class="top"><span class="id"><i style="display:inline-block;width:7px;height:7px;border-radius:2px;` +
+        `background:${colorFor(w.id)};margin-right:5px"></i>${w.id}</span>` +
+        `<span class="d" style="font-size:10px;color:var(--dim)">${down ? "DOWN" : (w.draining ? "DRAINING" : w.status)}</span></div>` +
+      `<div class="model">${esc(w.model || "unknown model")}</div>` +
+      `<div class="badges">` +
+        (w.streaming ? `<span class="badge stream">streaming</span>` : `<span class="badge batch">batch only</span>`) +
+        (w.serializable ? `<span class="badge cache">checkpointable</span>` : `<span class="badge">replay only</span>`) +
+        `<span class="badge">key ${(w.compatibility_key_hash || "").replace("sha256:", "").slice(0, 6)}</span>` +
+      `</div>` +
+      `<div class="nums"><span>sessions <b>${w.outstanding}</b></span>` +
+        `<span>${rate(w.id)}/s</span>` +
+        `<span>${fmtBytes(n.mem_bytes)}</span></div>` +
+      `<div class="bar"><i class="${memCls}" style="width:${Math.min(100, pct || 0)}%"></i></div>` +
+      (why ? `<div class="why">${why}</div>` : "");
+    d.onclick = (e) => openMenu(e, w.id);
+    el.appendChild(d);
+  }
+
+  const keys = new Set(workers.map((w) => w.compatibility_key_hash));
+  $("fleet-note").innerHTML =
+    `${workers.length} workers, ${keys.size} compatibility keys. Same key → a failover can restore a ` +
+    `checkpoint; different key → full audio replay. Gray-failure rule: eject above ` +
+    `<b>${f.eject_at_multiple || 3}×</b> the cluster p95 (now <b>${(f.cluster_p95_ms || 0).toFixed(1)}ms</b>).`;
+}
+
+const ACTIONS = [
+  ["kill", "", "SIGKILL the process"],
+  ["restore", "", "respawn it"],
+  ["drain?on=true", "", "no new sessions"],
+  ["drain?on=false", "", "back in rotation"],
+  ["blackhole?on=true", "", "accept, never answer"],
+  ["slow?ms=800", "", "+800ms per call"],
+  ["429?rate=0.5", "", "rate-limit half"],
+  ["corrupt?on=true", "", "invalidate checkpoints"],
+  ["reset", "", "clear request faults"],
+];
+
+function openMenu(e, worker) {
+  e.stopPropagation();
+  const m = $("menu");
+  m.innerHTML = `<h3>${worker}</h3>`;
+  for (const [path, , desc] of ACTIONS) {
+    const b = document.createElement("button");
+    b.innerHTML = `${path.split("?")[0]}${path.includes("on=false") ? " off" : ""}<small>${desc}</small>`;
+    b.onclick = () => { fire(worker, path); m.style.display = "none"; };
+    m.appendChild(b);
+  }
+  m.style.display = "block";
+  m.style.left = Math.min(e.clientX, innerWidth - m.offsetWidth - 12) + "px";
+  m.style.top = Math.min(e.clientY, innerHeight - m.offsetHeight - 12) + "px";
+}
+document.addEventListener("click", () => { $("menu").style.display = "none"; });
+
+async function fire(worker, path) {
+  try { await fetch(`/api/chaos/${worker}/${path}`, { method: "POST" }); }
+  catch (err) { console.warn("chaos", err); }
+}
+
+document.querySelectorAll("[data-load]").forEach((b) => {
+  b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const r = await fetch(`/api/load/${b.dataset.load}?duration=30m`, { method: "POST" });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        $("load-state").textContent = body.error || `error ${r.status}`;
+      }
+    } finally { b.disabled = false; pollLoad(); }
+  };
+});
+
+async function pollLoad() {
+  try {
+    const d = await (await fetch("/api/load")).json();
+    const el = $("load-state");
+    if (!d.available) {
+      el.textContent = "no load generator";
+      document.querySelectorAll("[data-load]").forEach((b) => (b.disabled = true));
+      return;
+    }
+    const st = d.status || {};
+    el.textContent = st.running ? `${st.streams} streams · ${st.elapsed_s}s` : "idle";
+    document.querySelectorAll("[data-load]").forEach((b) =>
+      b.classList.toggle("on", st.running && String(st.streams) === b.dataset.load));
+  } catch (e) { /* the SSE feed already reports connectivity */ }
+}
+
+// ---------------------------------------------------------------------
+// Charts — one canvas, three views behind tabs.
+// ---------------------------------------------------------------------
+document.querySelectorAll("[data-tab]").forEach((b) => {
+  b.onclick = () => {
+    S.tab = b.dataset.tab;
+    document.querySelectorAll("[data-tab]").forEach((x) => x.classList.toggle("on", x === b));
+    drawChart();
+  };
+});
+
+function prep(h) {
+  const cv = $("chart"), dpr = devicePixelRatio || 1, w = cv.clientWidth || 320;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.font = "10px ui-monospace, monospace";
+  return { g, w, h };
+}
+
+function axes(g, w, h, pad, max, unit) {
+  g.strokeStyle = "#21262d"; g.fillStyle = "#6e7681";
+  for (let i = 0; i <= 3; i++) {
+    const y = pad.t + (h - pad.t - pad.b) * (1 - i / 3);
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+    g.fillText(Math.round(max * i / 3) + unit, 4, y + 3);
+  }
+}
+
+function marks(g, X, pad, ih, t0) {
+  for (const m of S.marks) {
+    if (m.t < t0) continue;
+    g.strokeStyle = m.kind === "chaos" ? "#bc8cff" : "#f85149";
+    g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(X(m.t), pad.t); g.lineTo(X(m.t), pad.t + ih); g.stroke();
+    g.setLineDash([]);
+  }
+}
+
+function drawChart() {
+  if (S.tab === "traffic") drawTraffic();
+  else if (S.tab === "latency") drawLatency();
+  else drawResources();
+}
+
+// Stacked, not overlaid: the question during a kill is "where did that
+// worker's traffic go", and a stack answers it directly — total height is
+// fleet throughput, and the bands redistribute underneath it.
+function drawTraffic() {
+  const { g, w, h } = prep(170);
+  const pad = { l: 46, r: 8, t: 8, b: 16 }, iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+  $("chart-note").textContent = "backend calls/sec per worker";
+
+  if (S.traffic.length < 2) {
+    g.fillStyle = "#6e7681"; g.fillText("no backend traffic yet — press a load button", pad.l, pad.t + 16);
+    $("chart-legend").innerHTML = ""; return;
+  }
+  const workers = [];
+  for (const p of S.traffic) for (const id of Object.keys(p.rates)) if (!workers.includes(id)) workers.push(id);
+  workers.sort();
+
+  const t0 = S.traffic[0].t, t1 = S.traffic[S.traffic.length - 1].t || t0 + 1;
+  let max = 1;
+  for (const p of S.traffic) max = Math.max(max, workers.reduce((a, id) => a + (p.rates[id] || 0), 0));
+  max *= 1.1;
+  const X = (t) => pad.l + iw * (t - t0) / Math.max(1, t1 - t0);
+  const Y = (v) => pad.t + ih - ih * (v / max);
+  axes(g, w, h, pad, max, "/s");
+
+  const base = S.traffic.map(() => 0);
+  for (const id of workers) {
+    g.beginPath();
+    S.traffic.forEach((p, i) => { const x = X(p.t), y = Y(base[i] + (p.rates[id] || 0)); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    for (let i = S.traffic.length - 1; i >= 0; i--) g.lineTo(X(S.traffic[i].t), Y(base[i]));
+    g.closePath(); g.fillStyle = colorFor(id) + "cc"; g.fill();
+    S.traffic.forEach((p, i) => { base[i] += p.rates[id] || 0; });
+  }
+  marks(g, X, pad, ih, t0);
+  $("chart-legend").innerHTML = workers.map((id) =>
+    `<span><i style="background:${colorFor(id)}"></i>${id} ${rate(id)}/s</span>`).join("");
+}
+
+function drawLatency() {
+  const { g, w, h } = prep(170);
+  const pad = { l: 46, r: 8, t: 8, b: 16 }, iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+  $("chart-note").textContent = "backend push latency";
+
+  if (S.lat.length < 2) {
+    g.fillStyle = "#6e7681"; g.fillText("waiting for traffic…", pad.l, pad.t + 16);
+    $("chart-legend").innerHTML = ""; return;
+  }
+  const t0 = S.lat[0].t, t1 = S.lat[S.lat.length - 1].t || t0 + 1;
+  // Scaled to p99, never a fixed ceiling: the point of this chart is a
+  // spike, and a clipped spike is an unreadable chart.
+  let max = 1;
+  for (const p of S.lat) max = Math.max(max, p.p99);
+  max *= 1.15;
+  const X = (t) => pad.l + iw * (t - t0) / Math.max(1, t1 - t0);
+  const Y = (v) => pad.t + ih - ih * (v / max);
+  axes(g, w, h, pad, max, "ms");
+  marks(g, X, pad, ih, t0);
+
+  const series = [["p50", "#3fb950"], ["p95", "#d29922"], ["p99", "#f85149"]];
+  for (const [k, c] of series) {
+    g.strokeStyle = c; g.lineWidth = 1.5; g.beginPath();
+    S.lat.forEach((p, i) => { const x = X(p.t), y = Y(p[k]); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  }
+  g.lineWidth = 1;
+  const last = S.lat[S.lat.length - 1];
+  $("chart-legend").innerHTML = series.map(([k, c]) =>
+    `<span><i style="background:${c}"></i>${k} ${fmtMs(last[k])}</span>`).join("");
+}
+
+// Memory against each container's cgroup LIMIT, because that is the only
+// version of this graph that can warn you about anything: 900MB is
+// comfortable at 1536M and fatal at 1024M, and the failure it misses —
+// the OOM killer — looks exactly like the SIGKILL the chaos suite injects.
+function drawResources() {
+  const { g, w, h } = prep(170);
+  const pad = { l: 46, r: 8, t: 8, b: 16 }, iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+  $("chart-note").textContent = "memory as % of each container's cgroup limit";
+
+  const order = S.nodes.order || [];
+  const series = order.map((id) => ({ id, pts: (S.nodes.series[id] || []) })).filter((s) => s.pts.length > 1);
+  if (!series.length) {
+    g.fillStyle = "#6e7681"; g.fillText("sampling…", pad.l, pad.t + 16);
+    $("chart-legend").innerHTML = ""; return;
+  }
+  let t0 = Infinity, t1 = 0;
+  for (const s of series) { t0 = Math.min(t0, s.pts[0].at_ms); t1 = Math.max(t1, s.pts[s.pts.length - 1].at_ms); }
+  const X = (t) => pad.l + iw * (t - t0) / Math.max(1, t1 - t0);
+  const Y = (v) => pad.t + ih - ih * Math.min(1, v / 100);
+  axes(g, w, h, pad, 100, "%");
+
+  for (const s of series) {
+    g.strokeStyle = colorFor(s.id); g.lineWidth = 1.5; g.beginPath();
+    let pen = false;
+    for (const p of s.pts) {
+      // A node that stopped answering contributes nothing rather than a
+      // zero: a memory line that drops to the floor and one that stops
+      // are different events, and only one of them is a crash.
+      const v = p.mem_pct_limit;
+      if (v == null) { pen = false; continue; }
+      const x = X(p.at_ms), y = Y(v);
+      pen ? g.lineTo(x, y) : g.moveTo(x, y); pen = true;
+    }
+    g.stroke();
+  }
+  g.lineWidth = 1;
+  $("chart-legend").innerHTML = series.map((s) => {
+    const last = s.pts[s.pts.length - 1];
+    const q = last.is_gateway ? `${last.goroutines}g` : `q${last.queue_depth}`;
+    return `<span><i style="background:${colorFor(s.id)}"></i>${s.id} ` +
+      `${last.mem_pct_limit == null ? "–" : last.mem_pct_limit.toFixed(0) + "%"} · ${q}</span>`;
+  }).join("");
+}
+
+// ---------------------------------------------------------------------
+// Streams + inspector
+// ---------------------------------------------------------------------
+function renderStreams() {
+  const rows = (S.snap && S.snap.streams) || [];
+  $("stream-count").textContent = S.snap ? `${rows.length} of ${S.snap.streams_total}` : "";
+  const tb = $("streams");
+  tb.innerHTML = "";
+  for (const s of rows) {
+    const tr = document.createElement("tr");
+    if (s.id === S.selStream) tr.className = "sel";
+    tr.innerHTML =
+      `<td>${s.id}</td><td>${s.mode}</td><td>${s.worker}</td><td>${s.utt || "–"}</td>` +
+      `<td>${s.rev}</td><td>${s.failovers || ""}</td>` +
+      `<td><span class="chip ${s.state}">${s.state}</span></td>` +
+      `<td class="txt">${esc(s.last_text || "")}</td>`;
+    tr.onclick = () => selectStream(s.id);
+    tb.appendChild(tr);
+  }
+  if (!rows.length) tb.innerHTML = '<tr><td colspan="8" class="empty">no active streams — press a load button</td></tr>';
+  if (S.selStream) renderFlow();
+}
+
+function selectStream(id) {
+  S.selStream = S.selStream === id ? null : id;
+  S.log = [];
+  $("insp-id").textContent = S.selStream || "click a stream";
+  $("flow").classList.toggle("hide", !S.selStream);
+  renderStreams();
+  if (S.selStream) pollLog();
+  else $("log").innerHTML = '<div class="empty">Click a stream to see where its audio goes.</div>';
+}
+
+// The flow panel: where this session's packets went, and where its state
+// lives. The three state boxes are the three tiers — hot (worker memory),
+// warm (gateway checkpoint), recovery (gateway audio journal) — and they
+// are shown together because the whole argument of this project is what
+// survives when the hot one dies.
+function renderFlow() {
+  const s = ((S.snap && S.snap.streams) || []).find((x) => x.id === S.selStream);
+  if (!s) return;
+  const gatedPct = s.frames_in ? (100 * s.frames_gated / s.frames_in) : 0;
+  const box = (cls, title, value, detail) =>
+    `<div class="box ${cls}"><h4>${title}</h4><div class="v">${value}</div><div class="d">${detail}</div></div>`;
+
+  $("flow").innerHTML =
+    box("", "client → gateway",
+      `${s.frames_in} frames`,
+      `${(s.audio_ms_in / 1000).toFixed(1)}s audio · 20ms/frame · seq ${s.last_seq}`) +
+    box("", "VAD gate",
+      `${gatedPct.toFixed(0)}% gated`,
+      `${s.frames_voiced} speech / ${s.frames_gated} silence — gated frames are journaled but never sent`) +
+    box("", "gateway → worker",
+      `${s.chunks_out} chunks`,
+      `${fmtBytes(s.chunk_bytes_out)} to <b>${s.worker}</b>` +
+      (s.replayed_chunks ? ` · ${s.replayed_chunks} replayed` : "")) +
+    box("hot", "hot: worker state",
+      s.handle ? s.handle.slice(0, 10) : "–",
+      `pinned to <b>${s.worker}</b> · gen ${s.generation} — dies with the worker`) +
+    box("warm", "warm: checkpoint",
+      s.checkpoint_bytes ? fmtBytes(s.checkpoint_bytes) : "none",
+      s.checkpoint_bytes
+        ? `gateway-side, covers seq ${s.checkpoint_seq} — restore, then replay the tail`
+        : esc(s.checkpoint_why || "")) +
+    box("cold", "recovery: journal",
+      `${s.journal_records} frames`,
+      `${(s.journal_span_ms / 1000).toFixed(1)}s gateway-side — always enough to rebuild`);
+}
+
+async function pollLog() {
+  if (!S.selStream) return;
+  try {
+    const r = await fetch(`/api/streams/${S.selStream}/log`);
+    if (r.ok) { S.log = (await r.json()).events || []; renderLog(); }
+  } catch (e) { /* ignore */ }
+}
+
+function renderLog() {
+  const el = $("log");
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+  el.innerHTML = "";
+  for (const ev of S.log) {
+    let body;
+    if (ev.kind === "partial") body = `rev=${ev.rev} "${ev.text}"`;
+    else if (ev.kind === "final") body = `utt=${ev.utt} seq ${ev.seq_start}..${ev.seq_end}` +
+      (ev.latency_ms ? ` ${ev.latency_ms}ms` : "") + ` "${ev.text}" IMMUTABLE`;
+    else if (ev.kind.startsWith("failover")) body = ev.detail;
+    else body = [ev.detail, ev.utt && `utt=${ev.utt}`, ev.rev && `rev=${ev.rev}`,
+                 ev.epoch && `epoch=${ev.epoch}`, ev.seq_start && `seq=${ev.seq_start}`].filter(Boolean).join(" ");
+    const d = document.createElement("div");
+    d.innerHTML = `<span class="t">${clock(ev.at_ms)}</span> <span class="k-${ev.kind}">${ev.kind}</span>` +
+      (ev.worker ? ` <span class="t">${ev.worker}</span>` : "") + ` ${esc(body)}`;
+    el.appendChild(d);
+  }
+  if (!S.log.length) el.innerHTML = '<div class="empty">no events yet for this stream</div>';
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+async function pollNodes() {
+  try {
+    const r = await fetch("/api/nodes");
+    if (r.ok) { S.nodes = await r.json(); renderFleet(); if (S.tab === "nodes") drawChart(); }
+  } catch (e) { /* the SSE feed reports connectivity */ }
+}
+
+connect();
+pollNodes(); pollLoad();
+setInterval(pollNodes, 1000);
+setInterval(pollLog, 700);
+setInterval(pollLoad, 2000);
+addEventListener("resize", drawChart);
+</script>
+</body>
+</html>
