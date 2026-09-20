@@ -16,6 +16,7 @@ package router
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -375,6 +376,7 @@ func (w *Worker) report(ok bool, latency time.Duration, clusterP95 time.Duration
 // balanced — see "Hop 4"). Safe for concurrent use: every connection's
 // sessionLoop calls Pick/Report on the same shared instance.
 type Router struct {
+	mu      sync.RWMutex
 	workers []*Worker
 }
 
@@ -382,7 +384,32 @@ func New(workers []*Worker) *Router {
 	return &Router{workers: workers}
 }
 
-func (r *Router) Workers() []*Worker { return r.workers }
+// Workers returns a snapshot, so callers can inspect the fleet while a
+// control plane adds a newly verified worker. The Worker values themselves
+// remain shared: their health and load fields have their own synchronization.
+func (r *Router) Workers() []*Worker {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]*Worker(nil), r.workers...)
+}
+
+// Add makes a health-verified worker eligible for new sessions. Identity is
+// immutable for a worker lifetime, so replacing an existing ID is forbidden:
+// a silent replacement could join a different cache-compatibility cohort.
+func (r *Router) Add(worker *Worker) error {
+	if worker == nil || worker.ID == "" {
+		return errors.New("router: worker must have an ID")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, existing := range r.workers {
+		if existing.ID == worker.ID {
+			return fmt.Errorf("router: worker %q already exists", worker.ID)
+		}
+	}
+	r.workers = append(r.workers, worker)
+	return nil
+}
 
 // Find looks up a worker by ID — used by internal/coord to unbind a
 // session from the worker it's failing away from.
@@ -405,7 +432,7 @@ func (r *Router) Pool(id string) []*Worker {
 		return nil
 	}
 	pool := []*Worker{self}
-	for _, w := range r.workers {
+	for _, w := range r.Workers() {
 		if w.ID != id && w.CompatibilityKey == self.CompatibilityKey {
 			pool = append(pool, w)
 		}
@@ -414,7 +441,7 @@ func (r *Router) Pool(id string) []*Worker {
 }
 
 func (r *Router) Find(id string) (*Worker, bool) {
-	for _, w := range r.workers {
+	for _, w := range r.Workers() {
 		if w.ID == id {
 			return w, true
 		}
@@ -486,7 +513,7 @@ func (r *Router) Find(id string) (*Worker, bool) {
 // and still covers every worker.
 func (r *Router) peerP95(subject *Worker) time.Duration {
 	var each []time.Duration
-	for _, w := range r.workers {
+	for _, w := range r.Workers() {
 		if w.ID == subject.ID {
 			continue
 		}
@@ -513,7 +540,7 @@ func (r *Router) peerP95(subject *Worker) time.Duration {
 // worker is judged against peerP95 of the others.
 func (r *Router) clusterP95() time.Duration {
 	var each []time.Duration
-	for _, w := range r.workers {
+	for _, w := range r.Workers() {
 		w.mu.Lock()
 		if len(w.latencies) >= minLatencySamples {
 			each = append(each, p95(w.latencies))
@@ -558,6 +585,7 @@ func modeSupported(modes []string, mode session.Mode) bool {
 // identical worker ten times in a row, not by inspection.
 func (r *Router) Pick(mode session.Mode, exclude map[string]bool, prefer session.CacheCompatibilityKey) (*Worker, error) {
 	now := time.Now()
+	workers := r.Workers()
 	var best *Worker
 	// A worker whose ejection backoff has expired and which is owed one
 	// trial request. Held aside from the scoring competition entirely —
@@ -565,8 +593,8 @@ func (r *Router) Pick(mode session.Mode, exclude map[string]bool, prefer session
 	var probe *Worker
 	bestScore := math.MaxFloat64
 
-	for _, idx := range rand.Perm(len(r.workers)) {
-		w := r.workers[idx]
+	for _, idx := range rand.Perm(len(workers)) {
+		w := workers[idx]
 		if exclude != nil && exclude[w.ID] {
 			continue
 		}
@@ -669,7 +697,7 @@ func (r *Router) Report(id string, ok bool, latency time.Duration) {
 	// The baseline EXCLUDES this worker — see peerP95. A worker must not
 	// be part of the standard it is judged against.
 	now := time.Now()
-	for _, w := range r.workers {
+	for _, w := range r.Workers() {
 		if w.ID == id {
 			w.report(ok, latency, r.peerP95(w), now)
 			return

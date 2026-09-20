@@ -10,7 +10,7 @@
 //
 // The obvious fix — send the state with every request — was measured and
 // rejected: at a 160 ms chunk policy the round trip is 427x the audio it
-// carries (fp32), 107x at int8. See docs/BIFROST-KVCACHE.md.
+// carries (fp32), 107x at int8. See docs/KVCACHE-ALTERNATIVES.md.
 //
 // **What production does instead**, and what this implements: move the
 // state OUT of the worker into a shared tier, and put a *reference* in the

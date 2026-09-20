@@ -148,7 +148,7 @@ func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
 //     health across a set of interchangeable endpoints — while every
 //     decision needing runtime knowledge stays in the router.
 //
-// That is the two-layer shape production uses (docs/PRODUCTION-SHAPE.md):
+// That is the two-layer shape production uses (docs/KVCACHE-ALTERNATIVES.md):
 // a gateway that resolves names and fails over, in front of a pool whose
 // members are interchangeable by construction.
 func (c *Client) TranscribeVia(ctx context.Context, wav []byte, model string, fallbacks []string) (string, error) {

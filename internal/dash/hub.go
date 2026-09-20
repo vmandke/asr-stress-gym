@@ -86,6 +86,7 @@ type Stream struct {
 	ID            string `json:"id"`
 	Mode          string `json:"mode"`
 	Worker        string `json:"worker"`
+	Family        string `json:"family"`
 	CompatKey     string `json:"compat_key"`
 	State         string `json:"state"`
 	Utterance     string `json:"utt"`
@@ -183,13 +184,17 @@ func nowMs() int64 { return time.Now().UnixNano() / 1e6 }
 // SessionStarted records a session that has been admitted AND opened
 // against a worker. Called after the Open succeeds, so a stream row never
 // exists without a worker to attribute it to.
-func (h *Hub) SessionStarted(id, mode, worker, compatKey string) {
+func (h *Hub) SessionStarted(id, mode, worker, compatKey string, family ...string) {
 	if h == nil {
 		return
 	}
+	modelFamily := ""
+	if len(family) > 0 {
+		modelFamily = family[0]
+	}
 	h.mu.Lock()
 	s := &Stream{
-		ID: id, Mode: mode, Worker: worker, CompatKey: compatKey,
+		ID: id, Mode: mode, Worker: worker, Family: modelFamily, CompatKey: compatKey,
 		State: StateListening, StartedAtMs: nowMs(),
 	}
 	h.streams[id] = s

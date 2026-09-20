@@ -121,4 +121,4 @@ echo
 echo "  Click a node to kill / drain / slow it. Click a stream to see where"
 echo "  its audio goes and which state lives where."
 echo "  Stop the load from the page, or:  curl -XPOST ${gateway}/api/load/0"
-echo "  Stop everything:                  docker compose down"
+echo "  Stop everything:                  make down"

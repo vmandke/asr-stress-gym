@@ -37,7 +37,7 @@ import (
 // same member, so in the ordinary case the serving worker still has the
 // previous chunk's state live in its own hot cache and pays nothing to
 // resume — measured at 1.88x faster than fanning out, and zero bytes
-// fetched (docs/STATELESS-KVTIER.md). Bifrost moves off the primary only
+// fetched (docs/KVCACHE.md). Bifrost moves off the primary only
 // when it fails, and the replacement then pays one fetch. That is exactly
 // the production posture: affinity as an OPTIMIZATION, not a correctness
 // requirement.
@@ -252,7 +252,7 @@ func (c *StatelessClient) Health(ctx context.Context) (WorkerAdvert, error) {
 // forwards unknown multipart fields to the provider verbatim — measured,
 // along with the fact that it STRIPS unknown response fields, which is why
 // nothing comes back this way and a miss is signalled as a status code.
-// See docs/STATELESS-KVTIER.md.
+// See docs/KVCACHE.md.
 func (c *StatelessClient) call(ctx context.Context, fields map[string]string, audio []byte) (string, error) {
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)

@@ -11,8 +11,8 @@ cache, routing, replay, failover and observability.
 
 ```bash
 make live             # fleet + per-family KV tiers + Bifrost + stateless
-                      # streaming + load, then prints the mic URL
-make live STREAMS=0   # same, without background load
+                      # streaming, idle by default, then prints the mic URL
+make live STREAMS=20  # same, with 20 background streams
 ```
 
 Then open the printed `…/dashboard/mic.html` and **talk into it while the
@@ -22,6 +22,17 @@ session is pinned or on the shared KV tier, the cache's actual tensors and
 sizes, how your audio is chunked, how much the VAD gated as silence, and
 your own state versions being published and retired. Kill the worker
 serving you from the dashboard and keep talking — the transcript survives.
+
+The dashboard starts with one worker in each streaming family. Click **+ zip**
+or **+ ctc** to launch a new, cache-compatible worker during
+the demo. The isolated local fleet manager waits for its health
+advertisement, registers its Bifrost provider, and the gateway verifies its
+compatibility key and family KVTier before it is allowed into routing. This
+is deliberately a local-demo feature: only that service holds the Docker
+socket.
+
+See [`docs/FLEET-MANAGER.md`](docs/FLEET-MANAGER.md) for the lifecycle and
+security boundary.
 
 Microphone capture needs a secure context. `localhost` counts as one, a LAN
 IP does not, so open the URL exactly as printed.
@@ -45,26 +56,22 @@ Every deployed adapter owns a **real KV cache**: it drives the model's ONNX
 graphs directly rather than through a wrapper that hides the state.
 
 ```
-worker-zip-1/2        zipformer_kv       transducer        35 tensors   1.09 MB
-worker-ctc-1/2        conformer_ctc_kv   CTC                3 tensors   2.72 MB
-worker-whisper-1/2    whisper_kv         encoder-decoder    2 tensors   5.51 MB
+worker-zip-*          zipformer_kv       transducer        35 tensors   1.09 MB
+worker-ctc-*          conformer_ctc_kv   CTC                3 tensors   2.72 MB
 ```
 
 Four properties of that fleet are load-bearing:
 
-- **Each pair shares one compatibility key**, so a failover inside a pair
-  is the cheap path — a 1.09 MB safetensors blob moves and the session
-  continues.
-- **The three families cannot read each other's state.** Transducer state
+- **Workers in one family share one compatibility key**, so a failover inside
+  that family is the cheap path — a 1.09 MB safetensors blob moves and the
+  session continues.
+- **The two families cannot read each other's state.** Transducer state
   is structurally meaningless to CTC, so a cross-family failover must build
   fresh state and replay the journal. That degradation is the finding, not
   a gap.
-- **Whisper cannot stream.** Its encoder consumes a fixed 30 s window, so
-  it is a healthy backend the router must *refuse* for an online session
-  rather than mis-serve.
-- **State sizes differ 5×.** That is why each family gets its own KV tier
-  rather than sharing one byte ceiling — a whisper burst would otherwise
-  evict zipformer sessions out of a shared LRU.
+- **State sizes differ.** That is why each family gets its own KV tier
+  rather than sharing one byte ceiling — one family's burst must not evict
+  another family's sessions.
 
 ## Entry points
 
@@ -81,7 +88,8 @@ make bench               # the frozen loadgen benchmark set
 make kv-quant            # fp32 / fp16 / int8 blob size vs text drift
 make test                # Go + Python suites
 make models              # fetch model weights
-make up / make down      # compose up --build / down -v
+make up / make down      # compose up --build / remove every demo container
+make reset               # make down, then remove Compose volumes too
 ```
 
 **Port 7000 on macOS.** AirPlay Receiver listens there by default since
@@ -96,7 +104,7 @@ to a stream of audio, end to end: chunking, dispatch, where every piece of
 state lives, what each step costs. Written from measured output, not prose.
 
 - [`docs/KVCACHE.md`](docs/KVCACHE.md) — the KV cache and the stateless
-  path: what the three families' caches actually contain, the shared tier,
+  path: what the streaming families' caches actually contain, the shared tier,
   version lifecycle, what it costs, and the one known gap.
 - [`docs/KVCACHE-ALTERNATIVES.md`](docs/KVCACHE-ALTERNATIVES.md) — every
   design considered and rejected, with the number that settled it: Bifrost

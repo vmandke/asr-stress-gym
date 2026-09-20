@@ -23,8 +23,8 @@ x-worker-resources: &worker-resources
 #
 # Blobs are opaque and the worker refuses a foreign compatibility key at
 # load (422), so a single tier would be correct. It would not be isolated.
-# A burst of whisper sessions (5.51 MB of state each) sharing one byte
-# ceiling with zipformer (1.09 MB) evicts zipformer state, and those
+# A burst of large-family sessions sharing one byte ceiling with zipformer
+# (1.09 MB) evicts zipformer state, and those
 # sessions then take a 424 and have to replay — a cross-family blast
 # radius created purely by co-tenancy. Separate tiers also give each
 # family its own failure domain, and keep the compatibility key as a
@@ -76,60 +76,45 @@ services:
       # M8 can turn this off for an honest cold-replay comparison; ordinary
       # gateway runs always create checkpoints.
       CHECKPOINTS_ENABLED: "${CHECKPOINTS_ENABLED:-true}"
-      # Empty unless the `bifrost` profile is up. Empty means the gateway
-      # builds a nil Bifrost client and every final takes the direct path
-      # — which is also the fallback on any Bifrost failure, so this is
-      # safe to set and safe to leave unset.
-      BIFROST_URL: "${BIFROST_URL:-}"
+      # The streaming control plane always goes through Bifrost. KV state
+      # remains on the worker↔tier data plane, never in this request.
+      BIFROST_URL: "${BIFROST_URL:-http://bifrost:8080}"
       # Which provider Bifrost routes a final to, and where it falls back.
       # Each worker is its own provider (bifrost/config.json).
       #
-      # The default primary is a zipformer worker rather than the Whisper
-      # one, for a measured reason: with every final going to Whisper, a
-      # 20-stream run showed final_p50 at 4721ms. Whisper re-transcribes the
-      # whole utterance; zipformer is the same family the partials came
-      # from, so the final is both fast and consistent with what the client
-      # has already displayed. Point this at worker-d/whisper-1 to trade
-      # latency for a second opinion from a different architecture.
-      BIFROST_MODEL: "${BIFROST_MODEL:-worker-whisper-1/whisper-1}"
+      BIFROST_MODEL: "${BIFROST_MODEL:-worker-zip-1/asr-1}"
       # The ordered fallback chain. This is the one Bifrost feature doing
       # real, non-duplicated work here: the gateway implements failover for
       # the STREAMING path only (internal/coord) and has nothing equivalent
       # for finals, so without this a dead primary means every final falls
       # back to the local direct path and Bifrost contributes nothing.
-      BIFROST_FALLBACKS: "${BIFROST_FALLBACKS:-worker-whisper-2/whisper-1,worker-zip-1/whisper-1,worker-ctc-1/whisper-1}"
+      BIFROST_FALLBACKS: "${BIFROST_FALLBACKS:-worker-ctc-1/asr-1}"
       # Opt-in: route ONLINE finals through Bifrost too. Off by default
       # because an online final has accumulated inference state behind it
       # that a stateless Bifrost request discards and recomputes — see
       # finalText in cmd/gateway/conn.go. Offline finals always route
       # through Bifrost when it is enabled, because there is no such state.
       BIFROST_FINALS: "${BIFROST_FINALS:-}"
-      # Opt-in: route ONLINE STREAMING through Bifrost by moving KV state
-      # to the family's shared tier, instead of pinning the session to one
-      # worker. Off by default — it trades freedom from affinity for state
-      # transfer whenever a chunk lands somewhere new, which is a different
-      # set of trade-offs rather than a strict improvement. Needs the
-      # bifrost profile up. See docs/STATELESS-KVTIER.md.
-      STATELESS_STREAM: "${STATELESS_STREAM:-}"
+      # Default runtime path: Bifrost routes only inside the selected
+      # compatibility cohort and workers exchange state through its KV tier.
+      STATELESS_STREAM: "${STATELESS_STREAM:-1}"
       # Where the load generator's control API lives, for the dashboard's
       # POST /api/load/{n}. Unset means the load buttons report "no load
       # generator configured" rather than failing silently.
       LOADGEN_URL: "${LOADGEN_URL:-http://loadgen:8090}"
+      # The only path from the dashboard to lifecycle operations. The
+      # manager is private to this Compose network and owns the Docker
+      # socket; the gateway only verifies/adopts its returned worker.
+      FLEET_MANAGER_URL: "${FLEET_MANAGER_URL:-http://fleet-manager:8091}"
       # id=url pairs, comma-separated (cmd/gateway/main.go's
       # parseWorkerURLs) — internal compose DNS names, port 9000 (the
       # worker's own port; 9001 is the supervisor's admin-only port, a
       # separate concern the router never talks to).
-      # worker-e is optional: with no models profile buildRouter logs and
-      # excludes it; with --profile models it becomes part of the fleet.
-      # Keep comments outside the folded scalar — comments inside it become
-      # literal text in WORKER_URLS.
-      WORKER_URLS: >-
-        worker-zip-1=http://worker-zip-1:9000,
-        worker-zip-2=http://worker-zip-2:9000,
-        worker-ctc-1=http://worker-ctc-1:9000,
-        worker-ctc-2=http://worker-ctc-2:9000,
-        worker-whisper-1=http://worker-whisper-1:9000,
-        worker-whisper-2=http://worker-whisper-2:9000
+      # One worker per family is the live-demo default. The fleet manager
+      # adds verified workers at runtime; there is no static replica-count
+      # knob. Keeping the seed list explicit lets the router learn the
+      # canonical compatibility cohort from a real health advertisement.
+      WORKER_URLS: "${WORKER_URLS:-worker-zip-1=http://worker-zip-1:9000,worker-ctc-1=http://worker-ctc-1:9000}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:7000/health"]
       interval: 2s
@@ -148,15 +133,12 @@ services:
     # correctness requirement the gateway relies on.
     depends_on:
       worker-zip-1: { condition: service_healthy }
-      worker-zip-2: { condition: service_healthy }
       worker-ctc-1: { condition: service_healthy }
-      worker-ctc-2: { condition: service_healthy }
-      worker-whisper-1: { condition: service_healthy }
-      worker-whisper-2: { condition: service_healthy }
 
   bifrost:
-    image: maximhq/bifrost:latest
-    profiles: ["bifrost"]
+    # Pinned because the fleet manager uses Bifrost's provider API to add a
+    # freshly healthy endpoint. `latest` makes that contract non-repeatable.
+    image: maximhq/bifrost:v1.5.0
     ports:
       - "${BIFROST_PORT:-8080}:8080"
     volumes:
@@ -179,11 +161,32 @@ services:
     restart: "no"
     depends_on:
       worker-zip-1: { condition: service_healthy }
-      worker-zip-2: { condition: service_healthy }
       worker-ctc-1: { condition: service_healthy }
-      worker-ctc-2: { condition: service_healthy }
-      worker-whisper-1: { condition: service_healthy }
-      worker-whisper-2: { condition: service_healthy }
+
+  # Demo lifecycle plane. It receives a narrowly scoped add-family request,
+  # creates only this repository's prebuilt worker image on this Compose
+  # network, checks /health, then registers its endpoint with Bifrost. Do not
+  # copy the Docker socket mount to Gateway or Bifrost.
+  fleet-manager:
+    build:
+      context: .
+      dockerfile: deploy/fleetmanager.Dockerfile
+    environment:
+      BIFROST_URL: "http://bifrost:8080"
+      FLEET_NETWORK: "${COMPOSE_PROJECT_NAME:-asr-stress-gym}_default"
+      FLEET_WORKER_IMAGE: "${FLEET_WORKER_IMAGE:-asr-stress-gym-worker:demo}"
+      KV_DTYPE: "${KV_DTYPE:-fp32}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8091/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 1
+      start_period: 1s
+    restart: "no"
+    depends_on:
+      bifrost: { condition: service_healthy }
 
   # The shared KV-cache tiers: what makes routing through Bifrost possible
   # for STREAMING traffic, not just offline finals.
@@ -215,36 +218,22 @@ services:
     ports:
       - "${KVTIER_CTC_PORT:-9502}:9500"
 
-  kvtier-whisper:
-    <<: *kvtier
-    command: ["-addr", ":9500", "-max-mb", "${KVTIER_WHISPER_MAX_MB:-1024}", "-ttl", "${KVTIER_TTL:-5m}"]
-    ports:
-      - "${KVTIER_WHISPER_PORT:-9503}:9500"
-
-  # --- the fleet: three KV-cache models, two replicas of each ----------
+  # --- the fleet: one KV-cache worker per family -----------------------
   #
-  # Every worker owns a real, serializable KV cache (worker/kvcache), and
-  # every worker has exactly one TWIN sharing its compatibility key. That
-  # pairing is the point: a same-model failover always has somewhere
-  # cache-compatible to land, so recovery RESTORES the cache instead of
-  # replaying audio. Before M11 the fleet had no such pair on real weights
-  # and checkpoint_restores_total was permanently 0.
+  # The initial live shape is deliberately small: zip-1 and ctc-1. Each
+  # owns a real, serializable KV cache. The dashboard's
+  # fleet manager launches additional workers during a demo and admits them
+  # only after they match this family's advertised compatibility key+tier.
   #
-  #   zip-1     / zip-2      zipformer transducer, 35 state tensors, 1.09 MB
-  #   ctc-1     / ctc-2      NeMo FastConformer CTC, 3 tensors, 2.72 MB
-  #   whisper-1 / whisper-2  Whisper decoder self-attention KV, 5.51 MB
+  #   zip-*                   zipformer transducer, 35 state tensors, 1.09 MB
+  #   ctc-*                   NeMo FastConformer CTC, 3 tensors, 2.72 MB
   #
-  # The three keys differ, so a cross-model failover is still demonstrable
-  # between pairs — and now it is a genuine choice (restore vs replay)
-  # rather than the only option.
+  # One seed worker per family. Additional workers are created by the fleet
+  # manager from the dashboard, after they advertise a compatible KV schema.
   #
-  # whisper is OFFLINE ONLY. It is not a streaming model, so router.Pick
-  # filters it out of every online session; offline work is what the
-  # gateway routes through Bifrost, which is what gives Bifrost real
-  # traffic to carry.
-
   worker-zip-1:
     build: { context: ., dockerfile: worker/Dockerfile }
+    image: "${FLEET_WORKER_IMAGE:-asr-stress-gym-worker:demo}"
     environment:
       WORKER_ID: "worker-zip-1"
       MODEL: "zipformer-en-20M"
@@ -269,34 +258,9 @@ services:
         limits: *worker-resources
     restart: "no"
 
-  worker-zip-2:
-    build: { context: ., dockerfile: worker/Dockerfile }
-    environment:
-      WORKER_ID: "worker-zip-2"
-      MODEL: "zipformer-en-20M"
-      ADAPTER: "zipformer_kv"
-      KV_DTYPE: "${KV_DTYPE:-fp32}"
-      # Shared KV tier. Set unconditionally: the worker treats it as inert
-      # until a request actually carries a kv_mode, so the default pinned
-      # path is unaffected by its presence (worker/kvtier.py).
-      KVTIER_URL: "http://kvtier-zip:9500"
-      KV_HOT_MAX: "${KV_HOT_MAX:-32}"
-    ports:
-      - "${WORKER_ZIP_2_ADMIN_PORT:-19002}:9001"
-      - "${WORKER_ZIP_2_PORT:-18002}:9000"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-      start_period: 5s
-    deploy:
-      resources:
-        limits: *worker-resources
-    restart: "no"
-
   worker-ctc-1:
     build: { context: ., dockerfile: worker/Dockerfile }
+    image: "${FLEET_WORKER_IMAGE:-asr-stress-gym-worker:demo}"
     environment:
       WORKER_ID: "worker-ctc-1"
       MODEL: "fastconformer-ctc"
@@ -310,84 +274,6 @@ services:
     ports:
       - "${WORKER_CTC_1_ADMIN_PORT:-19003}:9001"
       - "${WORKER_CTC_1_PORT:-18003}:9000"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-      start_period: 5s
-    deploy:
-      resources:
-        limits: *worker-resources
-    restart: "no"
-
-  worker-ctc-2:
-    build: { context: ., dockerfile: worker/Dockerfile }
-    environment:
-      WORKER_ID: "worker-ctc-2"
-      MODEL: "fastconformer-ctc"
-      ADAPTER: "conformer_ctc_kv"
-      KV_DTYPE: "${KV_DTYPE:-fp32}"
-      # Shared KV tier. Set unconditionally: the worker treats it as inert
-      # until a request actually carries a kv_mode, so the default pinned
-      # path is unaffected by its presence (worker/kvtier.py).
-      KVTIER_URL: "http://kvtier-ctc:9500"
-      KV_HOT_MAX: "${KV_HOT_MAX:-32}"
-    ports:
-      - "${WORKER_CTC_2_ADMIN_PORT:-19004}:9001"
-      - "${WORKER_CTC_2_PORT:-18004}:9000"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-      start_period: 5s
-    deploy:
-      resources:
-        limits: *worker-resources
-    restart: "no"
-
-  worker-whisper-1:
-    build: { context: ., dockerfile: worker/Dockerfile }
-    environment:
-      WORKER_ID: "worker-whisper-1"
-      MODEL: "whisper-tiny.en"
-      ADAPTER: "whisper_kv"
-      KV_DTYPE: "${KV_DTYPE:-fp32}"
-      # Shared KV tier. Set unconditionally: the worker treats it as inert
-      # until a request actually carries a kv_mode, so the default pinned
-      # path is unaffected by its presence (worker/kvtier.py).
-      KVTIER_URL: "http://kvtier-whisper:9500"
-      KV_HOT_MAX: "${KV_HOT_MAX:-32}"
-    ports:
-      - "${WORKER_WHISPER_1_ADMIN_PORT:-19005}:9001"
-      - "${WORKER_WHISPER_1_PORT:-18005}:9000"
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-      start_period: 5s
-    deploy:
-      resources:
-        limits: *worker-resources
-    restart: "no"
-
-  worker-whisper-2:
-    build: { context: ., dockerfile: worker/Dockerfile }
-    environment:
-      WORKER_ID: "worker-whisper-2"
-      MODEL: "whisper-tiny.en"
-      ADAPTER: "whisper_kv"
-      KV_DTYPE: "${KV_DTYPE:-fp32}"
-      # Shared KV tier. Set unconditionally: the worker treats it as inert
-      # until a request actually carries a kv_mode, so the default pinned
-      # path is unaffected by its presence (worker/kvtier.py).
-      KVTIER_URL: "http://kvtier-whisper:9500"
-      KV_HOT_MAX: "${KV_HOT_MAX:-32}"
-    ports:
-      - "${WORKER_WHISPER_2_ADMIN_PORT:-19006}:9001"
-      - "${WORKER_WHISPER_2_PORT:-18006}:9000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)"]
       interval: 2s

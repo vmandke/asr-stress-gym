@@ -97,8 +97,8 @@ type connConfig struct {
 	BifrostModelAlias string
 	// StatelessStream routes ONLINE streaming through Bifrost by moving KV
 	// state to a shared per-family tier, instead of pinning the session to
-	// one worker. Off by default: it is a different set of trade-offs, not
-	// a strict improvement — see docs/STATELESS-KVTIER.md.
+	// one worker. It is the Compose default; false remains only for focused
+	// protocol tests and an explicit local override.
 	StatelessStream  bool
 	NewAudioPipeline func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error)
 }
@@ -400,7 +400,24 @@ func handleControl(
 		}
 		deps.Pipeline = pipeline
 
-		target, resp, err := openWithRetry(ctx, cfg.Router, state.SessionID, mode, m)
+		var (
+			target *router.Worker
+			resp   backend.OpenResp
+		)
+		if cfg.StatelessStream {
+			var shared backend.Client
+			target, shared, resp, err = openStatelessWithRetry(ctx, cfg, state.SessionID, mode)
+			if err == nil {
+				*client = shared
+			}
+		} else {
+			// Retained only for explicitly disabled stateless mode and focused
+			// protocol tests. The Compose runtime defaults to the branch above.
+			target, resp, err = openWithRetry(ctx, cfg.Router, state.SessionID, mode, m)
+			if err == nil {
+				*client = target.Client
+			}
+		}
 		if err != nil {
 			// ErrNoCapacity means the filter stage emptied — every worker
 			// is ejected, out of rate budget, or the wrong shape for this
@@ -425,28 +442,9 @@ func handleControl(
 		state.Handle = resp.Handle
 		state.CompatibilityKey = target.CompatibilityKey
 		state.Generation = resp.Generation
-		*client = target.Client
 		*started = true
 
-		// Swap in the shared-tier client, if this session qualifies. The
-		// router has already done the part that genuinely needs runtime
-		// knowledge — capability filtering, rate budget, health, and the
-		// choice of FAMILY — and that is kept. What changes is only that
-		// the session is no longer bound to the individual worker the
-		// router landed on: state now lives in the family's tier, so any
-		// member can serve any chunk and Bifrost owns placement within
-		// the pool. See docs/PRODUCTION-SHAPE.md for why the split lands
-		// here and not elsewhere.
-		if sc, handle, ok := statelessClientFor(ctx, cfg, target, state.SessionID, mode); ok {
-			// The handle opened a moment ago is deliberately abandoned:
-			// it would hold worker-side state this path never reads.
-			// Closing it costs one round trip per session and keeps the
-			// worker's handle table honest, which its /health reports.
-			if err := target.Client.Close(ctx, resp.Handle); err != nil {
-				log.Printf("gateway[%s]: could not close the unused pinned handle: %v", state.SessionID, err)
-			}
-			*client = sc
-			state.Handle = handle
+		if cfg.StatelessStream && mode == session.ModeOnline {
 			log.Printf("gateway[%s]: stateless streaming via bifrost pool, tier=%s",
 				state.SessionID, target.KVTierURL)
 		}
@@ -454,7 +452,7 @@ func handleControl(
 		// After the Open, never before: a stream row exists only once
 		// there is a worker to attribute it to, so the dashboard never
 		// shows a session pinned to nothing.
-		cfg.Hub.SessionStarted(state.SessionID, string(mode), target.ID, string(target.CompatibilityKey))
+		cfg.Hub.SessionStarted(state.SessionID, string(mode), target.ID, string(target.CompatibilityKey), target.Model)
 
 		// Piggyback session_id delivery on the existing ack contract
 		// (docs/PROTOCOL.md) rather than inventing a session.started
@@ -528,6 +526,39 @@ func openWithRetry(ctx context.Context, r *router.Router, sessionID string, mode
 		r.Report(target.ID, false, 0)
 	}
 	return nil, backend.OpenResp{}, fmt.Errorf("exhausted after %d attempts: %w", coord.MaxFailoverAttempts, lastErr)
+}
+
+// openStatelessWithRetry chooses a compatible model cohort without creating
+// a worker-local stream. Its virtual handle namespaces immutable state
+// versions in the shared KV tier; Bifrost performs actual chunk placement
+// within the selected cohort.
+func openStatelessWithRetry(ctx context.Context, cfg connConfig, sessionID string, mode session.Mode) (*router.Worker, backend.Client, backend.OpenResp, error) {
+	if mode != session.ModeOnline {
+		return nil, nil, backend.OpenResp{}, fmt.Errorf("stateless Bifrost streaming supports online sessions only")
+	}
+	if !cfg.Bifrost.Enabled() {
+		return nil, nil, backend.OpenResp{}, fmt.Errorf("Bifrost is required for stateless streaming")
+	}
+	excluded := map[string]bool{}
+	for attempt := 0; attempt < coord.MaxFailoverAttempts; attempt++ {
+		target, err := cfg.Router.Pick(mode, excluded, "")
+		if err != nil {
+			return nil, nil, backend.OpenResp{}, err
+		}
+		sc, handle, ok := statelessClientFor(ctx, cfg, target, sessionID)
+		if ok {
+			return target, sc, backend.OpenResp{
+				Handle:               handle,
+				CompatibilityKeyHash: string(target.CompatibilityKey),
+				Capabilities:         target.Capabilities,
+				Generation:           0,
+			}, nil
+		}
+		// Not a failed request: this worker simply cannot participate in the
+		// mandatory shared-tier path. Do not eject it from health tracking.
+		excluded[target.ID] = true
+	}
+	return nil, nil, backend.OpenResp{}, fmt.Errorf("no shared-KV worker available for %s", mode)
 }
 
 func handleAudioFrame(ctx context.Context, cfg connConfig, f wire.Frame, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
@@ -631,7 +662,7 @@ func handleAudioFrame(ctx context.Context, cfg connConfig, f wire.Frame, deps co
 // Bifrost is then doing the job it is genuinely good at — retry, failover
 // and health across a set of interchangeable endpoints — while every
 // decision needing runtime knowledge stays in the router. That is the
-// two-layer shape production uses; see docs/PRODUCTION-SHAPE.md.
+// two-layer shape production uses; see docs/KVCACHE-ALTERNATIVES.md.
 //
 // Falls back to the configured static model when the router has no view of
 // the worker (it was removed from the fleet, or this is a test with no
@@ -663,15 +694,11 @@ func bifrostPool(cfg connConfig, workerID string) (primary string, fallbacks []s
 //   - Bifrost, because it is what routes within the pool. Without it the
 //     gateway would be picking a worker per chunk itself, which is the
 //     thing being delegated.
-//   - ONLINE only. An offline session emits no partials and already has a
-//     better path: one stateless transcription of the whole utterance
-//     (finalText). Streaming its chunks through a tier would move state
-//     for no reason.
 //   - A tier the family actually advertises, and an adapter that can
 //     serialize. Both come from /health, so a fleet that cannot do this
 //     silently keeps the pinned path rather than failing sessions.
-func statelessClientFor(ctx context.Context, cfg connConfig, target *router.Worker, sessionID string, mode session.Mode) (backend.Client, string, bool) {
-	if !cfg.StatelessStream || !cfg.Bifrost.Enabled() || mode != session.ModeOnline {
+func statelessClientFor(ctx context.Context, cfg connConfig, target *router.Worker, sessionID string) (backend.Client, string, bool) {
+	if !cfg.StatelessStream || !cfg.Bifrost.Enabled() {
 		return nil, "", false
 	}
 	if target.KVTierURL == "" || !target.Capabilities.Serializable {
@@ -691,7 +718,7 @@ func statelessClientFor(ctx context.Context, cfg connConfig, target *router.Work
 		},
 		statelessPushTimeout,
 	)
-	resp, err := sc.Open(ctx, backend.OpenReq{SessionID: sessionID, Mode: string(mode)})
+	resp, err := sc.Open(ctx, backend.OpenReq{SessionID: sessionID, Mode: string(session.ModeOnline)})
 	if err != nil {
 		return nil, "", false
 	}

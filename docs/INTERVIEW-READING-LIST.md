@@ -5,6 +5,11 @@ Mooncake, Bifrost, and stateful inference clearly in an interview. It is
 ordered: do not start with Mooncake or a systems paper before you can explain
 what a key/value tensor is and why it grows.
 
+**If you have no time to read the sources themselves**, every item below is
+worked through — mechanism, numbers, and the answer to say out loud — in
+[INTERVIEW-DEEPDIVE.md](INTERVIEW-DEEPDIVE.md), including model answers to
+all fifteen drills in Part VII.
+
 ## Quick navigation
 
 - [Repository state and recovery](#part-i--understand-this-repository-first-4560-min)

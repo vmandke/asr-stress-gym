@@ -2,8 +2,8 @@
 # One command for the full live setup: the fleet, the per-family KV tiers,
 # Bifrost, stateless streaming, background load, and the microphone page.
 #
-#   ./scripts/live.sh          # 20 background streams
-#   ./scripts/live.sh 0        # everything up, no load
+#   ./scripts/live.sh                     # two workers, no background load
+#   ./scripts/live.sh 0                   # two workers, no background load
 #   NO_BUILD=1 ./scripts/live.sh
 #
 # This differs from start.sh in one way that matters: start.sh brings up
@@ -11,7 +11,7 @@
 # carries only offline finals. This one turns on STATELESS_STREAM, so a
 # session's KV cache lives in its model family's shared tier and every
 # chunk is routed by Bifrost within that family
-# (docs/STATELESS-KVTIER.md).
+# (docs/KVCACHE.md).
 #
 # **It rebuilds by default, and that is deliberate.** A stale worker image
 # silently ignores the `kv_mode` form field and quietly serves the request
@@ -28,16 +28,29 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source ./scripts/check_env.sh
 
-streams="${1:-20}"
+streams="${1:-0}"
 duration="${DEMO_DURATION:-30m}"
 
 bold() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
 fail() { printf '\n\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 
+worker_urls="worker-zip-1=http://worker-zip-1:9000,worker-ctc-1=http://worker-ctc-1:9000"
+worker_ports=(18001 18003)
+admin_ports=(19001 19003)
+export WORKER_URLS="${worker_urls}"
+
 # --- 0. the two settings this script exists to turn on ----------------
 export STATELESS_STREAM=1
 export BIFROST_URL="${BIFROST_URL:-http://bifrost:8080}"
+
+bold "Launch plan"
+note "gateway: WebSocket + VAD + state references"
+note "Bifrost: ${BIFROST_URL} (stateless request routing)"
+note "KV tiers: kvtier-zip, kvtier-ctc"
+note "seed workers: worker-zip-1, worker-ctc-1"
+note "fleet manager: enabled — add workers from the dashboard"
+note "background load: ${streams} stream(s), duration ${duration}"
 
 port="${GATEWAY_DASHBOARD_PORT:-}"
 if [[ -z "${port}" ]]; then
@@ -55,9 +68,9 @@ gw="http://localhost:${port}"
 # Before compose, not after: an unhealthy leftover blocks the gateway's
 # own dependency check, so the fleet would otherwise block its own
 # recovery. /admin/restore on a live child is a harmless no-op.
-bold "Reviving any worker left dead by earlier chaos"
+bold "Reviving selected workers"
 revived=0
-for p in 19001 19002 19003 19004 19005 19006; do
+for p in "${admin_ports[@]}"; do
   curl --fail --silent --max-time 2 -X POST "http://localhost:${p}/admin/restore" >/dev/null 2>&1 && revived=$((revived + 1))
 done
 if (( revived > 0 )); then note "restored ${revived} supervisor(s); letting their children load weights"; sleep 10
@@ -66,11 +79,11 @@ else note "nothing running yet — first start"; fi
 # --- 2. build and start -----------------------------------------------
 if [[ -n "${NO_BUILD:-}" ]]; then
   bold "Starting (NO_BUILD set — images assumed current)"
-  docker compose --profile bifrost up -d
+  docker compose up -d
 else
   bold "Building and starting everything"
   note "rebuilding so no container silently runs pre-kv_mode code"
-  docker compose --profile bifrost up -d --build
+  docker compose up -d --build
 fi
 
 printf '   waiting for the gateway '
@@ -83,17 +96,20 @@ curl --fail --silent --max-time 2 "${gw}/health" >/dev/null 2>&1 || {
   fail "gateway never became healthy"
 }
 
+bold "Running services"
+docker compose ps --format 'table {{.Name}}\t{{.Status}}' || true
+
 # --- 3. clear fault injection left over from an earlier session -------
 #
 # A blackhole or a 429 rate survives a gateway restart: it is state inside
 # the WORKER. Starting on top of one produces a fleet that looks broken
 # for no visible reason.
-for p in 18001 18002 18003 18004 18005 18006; do
+for p in "${worker_ports[@]}"; do
   curl --fail --silent --max-time 2 -X POST "http://localhost:${p}/admin/reset" >/dev/null 2>&1 || true
 done
 
 # --- 4. the per-family KV tiers ---------------------------------------
-bold "KV tiers — one per model family"
+bold "Seed model families (one worker each)"
 curl --fail --silent "${gw}/api/kv" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -139,17 +155,8 @@ print(f\"{len(live)}|{len(kv)}|{kv[0]['id'] if kv else ''}|{kv[0]['worker'] if k
 ")"
 IFS='|' read -r n_live n_kv sid worker <<< "${verdict}"
 if [[ "${n_kv:-0}" -gt 0 ]]; then
-  note "${n_kv}/${n_live} live sessions are on the SHARED KV TIER (handle kv:…)"
-  note "example: ${sid} currently served by ${worker}"
-  curl --fail --silent "${gw}/api/kv?session=${sid}" | python3 -c "
-import json, sys
-for p in json.load(sys.stdin)['pools']:
-    kd = p.get('keys')
-    ks = (kd.get('keys') or []) if isinstance(kd, dict) else []
-    for e in ks:
-        print(f\"   its state in {p['tier']}: version {e['key'].split(':')[-1]} \"
-              f\"({e['bytes']:,} B, {e['age_ms']} ms old)\")
-" || true
+  note "${n_kv}/${n_live} live sessions use the shared KV tier"
+  note "example session ${sid}; family selected at start: ${worker}"
 else
   note "WARNING: no session is on the shared tier."
   note "  every live session shows a plain worker handle, so STATELESS_STREAM"
@@ -178,19 +185,13 @@ fi
 # --- 7. where to go ---------------------------------------------------
 bold "Open this"
 echo "   🎤  ${gw}/dashboard/mic.html     speak into the fleet, live"
-echo "   📊  ${gw}/dashboard/             topology, chaos controls, load"
+echo "   📊  ${gw}/dashboard/             workers and active streams"
 echo
 echo "   Microphone capture needs a secure context. localhost counts as one,"
 echo "   a LAN IP does not — open the URL exactly as printed."
 echo
-echo "   On the mic page you can watch, while you speak:"
-echo "     · which worker answered, and whether it is pinned or on the tier"
-echo "     · the KV cache's actual tensors, sizes and roles"
-echo "     · how your audio is chunked, and how much the VAD gated as silence"
-echo "     · your own state versions appearing and being retired"
-echo
-echo "   Kill the worker serving you from the dashboard and keep talking —"
-echo "   the transcript should survive it."
+echo "   The dashboard starts with one worker per model family."
+echo "   Use + zip or + ctc in the dashboard to launch a compatible worker."
 echo
 echo "   Stop the load:   curl -XPOST ${gw}/api/load/stop"
-echo "   Stop everything: docker compose --profile bifrost down"
+echo "   Stop everything: make down"

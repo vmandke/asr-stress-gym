@@ -364,7 +364,7 @@ async def audio_transcriptions(
     worker in the model family: nothing the session needs lives inside a
     particular worker process any more. See worker/kvtier.py for why a
     local hot cache is part of this rather than an optimization bolted on
-    after, and docs/BIFROST-KVCACHE.md for the measurement that rules out
+    after, and docs/KVCACHE-ALTERNATIVES.md for the measurement that rules out
     the obvious alternative of shipping the tensors in the request.
 
     **Why these are form fields.** Measured against Bifrost: unknown

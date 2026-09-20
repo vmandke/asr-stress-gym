@@ -74,6 +74,12 @@
   .node .nums { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); }
   .node .nums b { color: var(--ink); font-weight: 600; }
   .node .why { font-size: 10.5px; margin-top: 4px; }
+  .quick { display: flex; gap: 5px; margin-top: 7px; }
+  .quick button { font: inherit; font-size: 10px; padding: 2px 7px; border-radius: 3px;
+    color: var(--ink); background: #0d1117; border: 1px solid var(--line); cursor: pointer; }
+  .quick .kill { color: var(--bad); border-color: #5b2429; }
+  .quick .restore { color: var(--ok); border-color: #1d572b; }
+  .fleet-add { color: var(--ok) !important; border-color: #1d572b !important; }
   .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 6px; overflow: hidden; }
   .bar > i { display: block; height: 100%; background: var(--accent); }
   .bar > i.warn { background: var(--warn); } .bar > i.bad { background: var(--bad); }
@@ -141,6 +147,7 @@
   .empty { color: var(--dim); padding: 14px 4px; }
   .note { color: var(--dim); font-size: 11px; margin-top: 8px; }
   .hide { display: none; }
+  .row2 > section:nth-child(2) { display: none; }
 </style>
 </head>
 <body>
@@ -162,6 +169,9 @@
   <section>
     <h2>Fleet
       <span class="ctl">
+        <span class="stat">add worker</span>
+        <button class="fleet-add" data-add-family="zip">+ zip</button>
+        <button class="fleet-add" data-add-family="ctc">+ ctc</button>
         <span class="stat">load</span>
         <button data-load="0">stop</button>
         <button data-load="5">5</button>
@@ -173,6 +183,7 @@
     </h2>
     <div class="nodes" id="nodes"></div>
     <div class="note" id="fleet-note"></div>
+    <div class="note" id="worker-legend">Worker card legend: <b>sessions</b> is active gateway sessions; <b>calls/s</b> is completed backend chunks per second; the bar and byte value are container memory. Green is healthy, amber degraded, red ejected/down, violet draining. Matching <b>key</b> badges mean workers can read the same KV state.</div>
     <div class="note" id="bifrost-note"></div>
   </section>
 
@@ -187,6 +198,7 @@
     </h2>
     <canvas id="chart" height="170"></canvas>
     <div id="chart-legend" class="legend"></div>
+    <div id="chart-help" class="note"></div>
   </section>
 
   <div class="row2">
@@ -194,7 +206,7 @@
       <h2>Streams <span class="sub" id="stream-count"></span></h2>
       <div class="scroll">
         <table>
-          <thead><tr><th>id</th><th>mode</th><th>worker</th><th>utt</th><th>rev</th><th>fo</th><th>state</th><th>text</th></tr></thead>
+          <thead><tr><th>id</th><th>mode</th><th>family</th><th>worker</th><th>utt</th><th>rev</th><th>fo</th><th>state</th><th>text</th></tr></thead>
           <tbody id="streams"></tbody>
         </table>
       </div>
@@ -363,7 +375,7 @@ function renderFleet() {
     let why = "";
     if (down) why = `<span style="color:var(--bad)">process is not answering</span>`;
     else if (w.draining) why = `<span style="color:var(--violet)">drained — no new sessions</span>`;
-    else if (!w.streaming) why = `<span style="color:var(--dim)">batch only — online never routes here</span>`;
+    else if (!w.streaming) why = `<span style="color:var(--dim)">offline family — online never routes here</span>`;
     else if (w.status === "ejected") why = `<span style="color:var(--bad)">ejected: p95 ${r.toFixed(1)}× cluster (limit ${limit}×)</span>`;
     else if (r >= limit * 0.66) why = `<span style="color:var(--warn)">p95 ${r.toFixed(1)}× cluster, limit ${limit}×</span>`;
 
@@ -376,7 +388,7 @@ function renderFleet() {
         `<span class="d" style="font-size:10px;color:var(--dim)">${down ? "DOWN" : (w.draining ? "DRAINING" : w.status)}</span></div>` +
       `<div class="model">${esc(w.model || "unknown model")}</div>` +
       `<div class="badges">` +
-        (w.streaming ? `<span class="badge stream">streaming</span>` : `<span class="badge batch">batch only</span>`) +
+        (w.streaming ? `<span class="badge stream">streaming</span>` : `<span class="badge batch">offline</span>`) +
         (w.serializable ? `<span class="badge cache">checkpointable</span>` : `<span class="badge">replay only</span>`) +
         `<span class="badge">key ${(w.compatibility_key_hash || "").replace("sha256:", "").slice(0, 6)}</span>` +
       `</div>` +
@@ -384,7 +396,12 @@ function renderFleet() {
         `<span>${rate(w.id)}/s</span>` +
         `<span>${fmtBytes(n.mem_bytes)}</span></div>` +
       `<div class="bar"><i class="${memCls}" style="width:${Math.min(100, pct || 0)}%"></i></div>` +
-      (why ? `<div class="why">${why}</div>` : "");
+      (why ? `<div class="why">${why}</div>` : "") +
+      `<div class="quick"><button class="kill" data-action="kill">kill</button>` +
+      `<button class="restore" data-action="restore">restore</button></div>`;
+    d.querySelectorAll("[data-action]").forEach((b) => {
+      b.onclick = (e) => { e.stopPropagation(); fire(w.id, b.dataset.action); };
+    });
     d.onclick = (e) => openMenu(e, w.id);
     el.appendChild(d);
   }
@@ -439,6 +456,25 @@ document.querySelectorAll("[data-load]").forEach((b) => {
         $("load-state").textContent = body.error || `error ${r.status}`;
       }
     } finally { b.disabled = false; pollLoad(); }
+  };
+});
+
+document.querySelectorAll("[data-add-family]").forEach((b) => {
+  b.onclick = async () => {
+    b.disabled = true;
+    const family = b.dataset.addFamily;
+    try {
+      const r = await fetch(`/api/fleet/${encodeURIComponent(family)}`, { method: "POST" });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        $("fleet-note").textContent = body.error || `could not add ${family} worker`;
+      } else {
+        const body = await r.json();
+        $("fleet-note").textContent = `${body.worker} is healthy, registered with Bifrost, and routeable.`;
+      }
+    } catch (err) {
+      $("fleet-note").textContent = `could not add ${family} worker: ${err}`;
+    } finally { b.disabled = false; }
   };
 });
 
@@ -511,6 +547,7 @@ function drawTraffic() {
   const { g, w, h } = prep(170);
   const pad = { l: 46, r: 8, t: 8, b: 16 }, iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
   $("chart-note").textContent = "backend calls/sec per worker";
+  $("chart-help").textContent = "Each colored band is one worker. The total stack height is fleet throughput; a band moving after a kill shows where requests were reassigned.";
 
   if (S.traffic.length < 2) {
     g.fillStyle = "#6e7681"; g.fillText("no backend traffic yet — press a load button", pad.l, pad.t + 16);
@@ -545,6 +582,7 @@ function drawLatency() {
   const { g, w, h } = prep(170);
   const pad = { l: 46, r: 8, t: 8, b: 16 }, iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
   $("chart-note").textContent = "backend push latency";
+  $("chart-help").textContent = "One backend chunk round-trip, in milliseconds. p50 is typical latency; p95 and p99 expose tail stalls. Vertical dashed marks are operator actions or failures.";
 
   if (S.lat.length < 2) {
     g.fillStyle = "#6e7681"; g.fillText("waiting for traffic…", pad.l, pad.t + 16);
@@ -581,6 +619,7 @@ function drawResources() {
   const { g, w, h } = prep(170);
   const pad = { l: 46, r: 8, t: 8, b: 16 }, iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
   $("chart-note").textContent = "memory as % of each container's cgroup limit";
+  $("chart-help").textContent = "Each line is one worker's memory divided by its own container limit. 100% is OOM risk; a gap means that worker stopped answering, not that memory fell to zero.";
 
   const order = S.nodes.order || [];
   const series = order.map((id) => ({ id, pts: (S.nodes.series[id] || []) })).filter((s) => s.pts.length > 1);
@@ -629,14 +668,14 @@ function renderStreams() {
     const tr = document.createElement("tr");
     if (s.id === S.selStream) tr.className = "sel";
     tr.innerHTML =
-      `<td>${s.id}</td><td>${s.mode}</td><td>${s.worker}</td><td>${s.utt || "–"}</td>` +
+      `<td>${s.id}</td><td>${s.mode}</td><td>${esc(s.family || "unknown")}</td><td>${s.worker}</td><td>${s.utt || "–"}</td>` +
       `<td>${s.rev}</td><td>${s.failovers || ""}</td>` +
       `<td><span class="chip ${s.state}">${s.state}</span></td>` +
       `<td class="txt">${esc(s.last_text || "")}</td>`;
     tr.onclick = () => selectStream(s.id);
     tb.appendChild(tr);
   }
-  if (!rows.length) tb.innerHTML = '<tr><td colspan="8" class="empty">no active streams — press a load button</td></tr>';
+  if (!rows.length) tb.innerHTML = '<tr><td colspan="9" class="empty">no active streams — press a load button</td></tr>';
   if (S.selStream) renderFlow();
 }
 

@@ -4,7 +4,7 @@ See state.py for what is actually cached and why sherpa-onnx could not
 give it to us, serde.py for how it crosses a process boundary safely, and
 quant.py for the transfer-width trade.
 
-`docs/KVCACHE-PLAN.md` records the survey of alternatives, and
+`docs/KVCACHE-ALTERNATIVES.md` records the survey of alternatives, and
 `docs/KVCACHE-DEEPDIVE.md` §10 the scorecard this package exists to change.
 """
 

@@ -1,9 +1,9 @@
-.PHONY: check start demo dashboard up down build test test-go test-worker models corpus chaos bench kv-quant stateless-ab stateless-proof live mic test-mic
+.PHONY: check start demo dashboard up down reset build test test-go test-worker models corpus chaos bench kv-quant stateless-ab stateless-proof live mic test-mic
 
 # --- the demo ---------------------------------------------------------
 #
 # One command. Brings the stack up, revives anything earlier chaos killed,
-# applies load, prints the dashboard URL. STREAMS=n to choose the load.
+# prints the dashboard URL. It starts idle; STREAMS=n applies background load.
 start:
 	./scripts/start.sh $(STREAMS)
 
@@ -43,8 +43,8 @@ stateless-proof:
 
 # The whole live setup in one command: fleet + per-family KV tiers +
 # Bifrost + stateless streaming + load + the microphone page.
-#   make live            # 20 background streams
-#   make live STREAMS=0  # everything up, no load
+#   make live            # starts idle (zero background streams)
+#   make live STREAMS=20 # everything up with background load
 live:
 	./scripts/live.sh $(STREAMS)
 
@@ -69,8 +69,18 @@ check:
 up:
 	docker compose up --build
 
+# Remove the whole demo, including workers launched from the dashboard.
+# This preserves named volumes. Use `make reset` only when their data should
+# be discarded too.
 down:
-	docker compose down -v
+	@workers="$$(docker ps -aq --filter label=asr-stress-gym.managed=true)"; \
+	 if [ -n "$$workers" ]; then docker rm -f $$workers; fi
+	docker compose down --remove-orphans
+
+reset:
+	@workers="$$(docker ps -aq --filter label=asr-stress-gym.managed=true)"; \
+	 if [ -n "$$workers" ]; then docker rm -f $$workers; fi
+	docker compose down --remove-orphans -v
 
 build:
 	go build ./...

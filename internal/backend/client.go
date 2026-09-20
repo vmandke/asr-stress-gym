@@ -138,7 +138,7 @@ type RestoreResp struct {
 
 // KVTierAdvert is the worker's half of the shared-KV-tier contract: where
 // it reads and publishes session state. See cmd/kvtier and
-// docs/STATELESS-KVTIER.md.
+// docs/KVCACHE.md.
 type KVTierAdvert struct {
 	Enabled bool   `json:"enabled"`
 	URL     string `json:"url"`

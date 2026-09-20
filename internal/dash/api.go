@@ -2,6 +2,7 @@ package dash
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,10 +37,11 @@ type Target struct {
 // Control is the dashboard's server side: the hub, the fleet view, the
 // node sampler, and the chaos targets.
 type Control struct {
-	Hub     *Hub
-	Fleet   FleetFunc
-	Nodes   *NodeSampler
-	Targets map[string]Target
+	Hub       *Hub
+	Fleet     FleetFunc
+	Nodes     *NodeSampler
+	Targets   map[string]Target
+	targetsMu sync.RWMutex
 
 	// Drain is supplied by cmd/gateway, closing over the router. Graceful
 	// drain is the one node action with no worker-side endpoint behind it:
@@ -54,6 +58,13 @@ type Control struct {
 	// would put the generator and the thing it measures in one process,
 	// one scheduler and one memory limit — see cmd/loadgen/control.go.
 	LoadgenURL string
+
+	// FleetManagerURL is the private lifecycle service used only by the
+	// dashboard's explicit add-worker buttons. It has the Docker socket;
+	// the gateway does not. RegisterWorker verifies its health advert and
+	// adds it to the router only after the manager has registered Bifrost.
+	FleetManagerURL string
+	RegisterWorker  func(family, id, url string) error
 
 	// Bifrost's own metrics, when it is configured. Nil otherwise, and
 	// nil-safe throughout.
@@ -77,7 +88,7 @@ func (c *Control) Mount(mux *http.ServeMux) {
 		// the connection and never answers, and the dashboard must not
 		// inherit that hang. Longer than nodeProbeTimeout because these
 		// are operator actions, not polls — a restore genuinely takes a
-		// moment to spawn a child.
+		// moment to load a model.
 		c.hc = &http.Client{Timeout: 5 * time.Second}
 	}
 
@@ -98,6 +109,7 @@ func (c *Control) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/streams/{id}/log", c.streamLogHandler)
 	mux.HandleFunc("GET /api/nodes", c.nodesHandler)
 	mux.HandleFunc("POST /api/chaos/{worker}/{action}", c.chaosHandler)
+	mux.HandleFunc("POST /api/fleet/{family}", c.addWorkerHandler)
 	mux.HandleFunc("POST /api/load/{n}", c.loadHandler)
 	mux.HandleFunc("POST /api/load/stop", c.loadStopHandler)
 	mux.HandleFunc("GET /api/load", c.loadStatusHandler)
@@ -219,7 +231,7 @@ func (c *Control) chaosHandler(w http.ResponseWriter, r *http.Request) {
 	worker := r.PathValue("worker")
 	action := r.PathValue("action")
 
-	target, ok := c.Targets[worker]
+	target, ok := c.target(worker)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown worker", "worker": worker})
 		return
@@ -289,6 +301,77 @@ func (c *Control) chaosHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"worker": worker, "action": action, "detail": detail, "worker_response": resp,
 	})
+}
+
+// addWorkerHandler deliberately has a separate endpoint from chaos. A
+// process fault is reversible and targets an already-known supervisor;
+// adding capacity asks a privileged external service to create a new
+// container. The gateway only forwards the narrowly shaped family request
+// and independently admits the returned worker into routing.
+func (c *Control) addWorkerHandler(w http.ResponseWriter, r *http.Request) {
+	if c.FleetManagerURL == "" || c.RegisterWorker == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "fleet manager is not configured"})
+		return
+	}
+	family := strings.ToLower(strings.TrimSpace(r.PathValue("family")))
+	if family != "zip" && family != "ctc" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "family must be zip or ctc"})
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"family": family})
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.FleetManagerURL, "/")+"/v1/workers", bytes.NewReader(body))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "fleet manager: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "fleet manager: " + strings.TrimSpace(string(data))})
+		return
+	}
+	var worker struct {
+		ID  string `json:"id"`
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<10)).Decode(&worker); err != nil || worker.ID == "" || worker.URL == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "fleet manager returned an invalid worker registration"})
+		return
+	}
+	if err := c.RegisterWorker(family, worker.ID, worker.URL); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "worker was started but gateway rejected it: " + err.Error()})
+		return
+	}
+	c.AddTarget(worker.ID, Target{WorkerURL: worker.URL, AdminURL: strings.Replace(worker.URL, ":9000", ":9001", 1)})
+	c.Hub.Chaos(worker.ID, "add", "family="+family)
+	writeJSON(w, http.StatusCreated, map[string]any{"worker": worker.ID, "family": family, "status": "routeable"})
+}
+
+// AddTarget is called after router admission so a dynamic worker receives the
+// same kill/restore controls as the boot fleet. A target is read on every
+// dashboard action, hence the small lock rather than exposing a mutable map.
+func (c *Control) AddTarget(id string, target Target) {
+	c.targetsMu.Lock()
+	defer c.targetsMu.Unlock()
+	if c.Targets == nil {
+		c.Targets = make(map[string]Target)
+	}
+	c.Targets[id] = target
+}
+
+func (c *Control) target(id string) (Target, bool) {
+	c.targetsMu.RLock()
+	defer c.targetsMu.RUnlock()
+	target, ok := c.Targets[id]
+	return target, ok
 }
 
 func (c *Control) post(url string, body any) (string, error) {

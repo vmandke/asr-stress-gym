@@ -20,7 +20,7 @@
 #                               checkpoints because it needs none.
 #
 # Everything printed is read back from the running stack. See
-# docs/STATELESS-KVTIER.md for the design and the trade-offs.
+# docs/KVCACHE.md for the design and the trade-offs.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -190,4 +190,4 @@ bold "Where to look next"
 note "gateway log:  docker compose logs gateway | grep 'stateless streaming'"
 note "tier stats :  curl -s localhost:9501/stats | python3 -m json.tool"
 note "dashboard  :  ${gw}/"
-note "design     :  docs/STATELESS-KVTIER.md"
+note "design     :  docs/KVCACHE.md"

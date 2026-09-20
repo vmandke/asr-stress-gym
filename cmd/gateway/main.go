@@ -169,6 +169,50 @@ func buildRouter(urls map[string]string) *router.Router {
 	return router.New(workers)
 }
 
+// registerFleetWorker is the second half of an add-worker operation. The
+// fleet manager has already created the container and registered its Bifrost
+// provider, but neither fact is permission to join a cache cohort. The
+// gateway re-reads /health and compares the advertised compatibility key to
+// the boot worker for that family before selection can ever see it.
+func registerFleetWorker(rt *router.Router, family, id, url string) error {
+	if !strings.HasPrefix(id, "worker-"+family+"-") {
+		return fmt.Errorf("worker %q does not have the requested %s family identity", id, family)
+	}
+	var cohort *router.Worker
+	prefix := "worker-" + family + "-"
+	for _, existing := range rt.Workers() {
+		if strings.HasPrefix(existing.ID, prefix) {
+			cohort = existing
+			break
+		}
+	}
+	if cohort == nil {
+		return fmt.Errorf("no boot worker exists for family %q", family)
+	}
+	client := backend.NewHTTPClient(url)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	advert, err := client.Health(ctx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("health check %s: %w", id, err)
+	}
+	if advert.CompatibilityKeyHash != string(cohort.CompatibilityKey) {
+		return fmt.Errorf("%s compatibility key %q does not match %s cohort %q", id,
+			advert.CompatibilityKeyHash, family, cohort.CompatibilityKey)
+	}
+	if !advert.Capabilities.Serializable || advert.KVTier == nil || !advert.KVTier.Enabled || advert.KVTier.URL != cohort.KVTierURL {
+		return fmt.Errorf("%s does not advertise the %s cohort's serializable KV tier", id, family)
+	}
+	worker := router.NewWorker(id, client, session.CacheCompatibilityKey(advert.CompatibilityKeyHash), advert.Capabilities)
+	worker.Model = advert.Model
+	worker.KVTierURL = advert.KVTier.URL
+	if err := rt.Add(worker); err != nil {
+		return err
+	}
+	log.Printf("gateway: dynamically admitted %s into %s cohort (key=%s tier=%s)", id, family, worker.CompatibilityKey, worker.KVTierURL)
+	return nil
+}
+
 // orNone keeps the startup log honest about an absent tier rather than
 // printing an empty field that reads as a truncated line.
 func orNone(s string) string {
@@ -353,24 +397,22 @@ func main() {
 			}
 		}
 	}
-	bf := bifrost.New(envOr("BIFROST_URL", ""), envOr("BIFROST_MODEL", ""), fallbacks, 15*time.Second)
+	// Bifrost is the default streaming control plane. Compose supplies this
+	// service name; a local developer can still override BIFROST_URL.
+	bf := bifrost.New(envOr("BIFROST_URL", "http://bifrost:8080"), envOr("BIFROST_MODEL", ""), fallbacks, 15*time.Second)
 	if bf.Enabled() {
-		scope := "offline sessions only"
-		if envOr("BIFROST_FINALS", "") != "" {
-			scope = "offline sessions AND online finals"
-		}
 		// The pool is chosen PER SESSION from the router's own view
 		// (conn.go bifrostPool), so there is no single chain to print
 		// here any more — printing one would describe behaviour the
 		// gateway no longer has.
-		log.Printf("gateway: Bifrost enabled at %s — routing %s; the provider pool is derived per session "+
+		log.Printf("gateway: Bifrost enabled at %s — routing stateless streaming; the provider pool is derived per session "+
 			"from the router's compatibility-key cohort, so a fallback chain can never cross a model family. "+
-			"Partials always direct.", envOr("BIFROST_URL", ""), scope)
+			"KV bytes travel directly between workers and their family tier.", envOr("BIFROST_URL", "http://bifrost:8080"))
 	}
 
 	// Bifrost's own metrics endpoint lives beside its API. Scraped for the
 	// dashboard only; nothing here influences routing.
-	bifrostStats := dash.NewBifrostScraper(envOr("BIFROST_URL", ""))
+	bifrostStats := dash.NewBifrostScraper(envOr("BIFROST_URL", "http://bifrost:8080"))
 	go bifrostStats.Run(context.Background())
 
 	hub := dash.NewHub()
@@ -384,8 +426,8 @@ func main() {
 		Bifrost:           bf,
 		Hub:               hub,
 		BifrostFinals:     envOr("BIFROST_FINALS", "") != "",
-		BifrostModelAlias: envOr("BIFROST_MODEL_ALIAS", "whisper-1"),
-		StatelessStream:   envOr("STATELESS_STREAM", "") != "",
+		BifrostModelAlias: envOr("BIFROST_MODEL_ALIAS", "asr-1"),
+		StatelessStream:   envEnabled("STATELESS_STREAM", true),
 		NewAudioPipeline: func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error) {
 			return audio.NewVADPipeline(sampleRateHz, chunkMs, audio.DefaultVADConfig)
 		},
@@ -393,11 +435,15 @@ func main() {
 
 	fleet := fleetView(rt, adm)
 	control := &dash.Control{
-		Hub:          hub,
-		Fleet:        fleet,
-		Nodes:        nodes,
-		Targets:      chaosTargets(parseWorkerURLs(workerURLs), envOr("WORKER_ADMIN_URLS", "")),
-		LoadgenURL:   envOr("LOADGEN_URL", ""),
+		Hub:             hub,
+		Fleet:           fleet,
+		Nodes:           nodes,
+		Targets:         chaosTargets(parseWorkerURLs(workerURLs), envOr("WORKER_ADMIN_URLS", "")),
+		LoadgenURL:      envOr("LOADGEN_URL", ""),
+		FleetManagerURL: envOr("FLEET_MANAGER_URL", ""),
+		RegisterWorker: func(family, id, url string) error {
+			return registerFleetWorker(rt, family, id, url)
+		},
 		BifrostStats: bifrostStats,
 		// Cohorts, derived live from the router rather than configured:
 		// workers are grouped by the compatibility key they advertise, and
