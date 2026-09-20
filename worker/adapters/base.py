@@ -95,3 +95,10 @@ class Adapter(Protocol):
     def finalize(self, st: Any) -> Delta: ...
     def serialize(self, st: Any) -> bytes: ...  # raises NotSupported
     def deserialize(self, blob: bytes) -> Any: ...  # raises NotSupported
+
+    # Optional. Adapters whose state is an opaque object owned by a C++
+    # runtime cannot answer this and simply do not implement it; the worker
+    # reports 0 for them, which is honest rather than a guess. An adapter
+    # that owns its state in numpy (adapters/zipformer_kv.py) returns real
+    # resident bytes, and that is what /health's state_bytes becomes.
+    # def state_bytes(self, st: Any) -> int: ...

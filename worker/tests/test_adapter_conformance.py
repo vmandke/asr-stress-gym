@@ -152,23 +152,36 @@ class TestAdapterConformance:
 
 
 @pytest.mark.skipif(not weights.available(), reason="no model weights on disk — run models/fetch.sh")
-def test_same_weights_under_different_runtimes_are_incompatible():
-    """The fleet's subtlest claim, asserted rather than described
-    (docs/implementation-plan.md, "What each pair demonstrates", row d->e):
-    worker-d and worker-e load the SAME weights and must still be
-    cache-incompatible, because the runtimes serialize state differently.
+def test_every_registered_adapter_owns_a_kv_cache():
+    """The fleet's defining property, asserted so it cannot regress.
 
-    The assertion is specifically that they differ in `runtime` and in
-    nothing else that would explain the mismatch away — if these two keys
-    ever diverged on model_id or model_revision as well, the pair would
-    still 'pass' a hash comparison while no longer demonstrating anything.
+    Every deployed adapter drives its model's ONNX graphs directly and owns
+    the state tensors, so all of them can checkpoint. The sherpa-wrapped
+    adapters and the mock moved to deprecated_experiments/ once that was
+    true of every worker: they could only ever exercise the degradation
+    path, and an adapter that silently reappeared claiming
+    serializable=False would make `checkpoint_degraded_total` ambiguous
+    again — is this a cross-model failover, or a worker that simply cannot
+    checkpoint?
     """
-    d = build("whisper_ct2").compatibility_key()
-    e = build("whisper_onnx").compatibility_key()
+    for name in sorted(_REGISTRY):
+        caps = build(name).capabilities()
+        assert caps.serializable, f"{name} cannot checkpoint — every deployed adapter must"
 
-    assert d.model_family == e.model_family
-    assert d.model_id == e.model_id
-    assert d.model_revision == e.model_revision
-    assert d.dtype == e.dtype
-    assert d.runtime != e.runtime
-    assert d.hash() != e.hash()
+
+def test_the_three_families_have_distinct_compatibility_keys():
+    """Three models, three keys. Cross-family failover is only meaningful
+    if the keys actually differ, and same-family restore is only safe if
+    replicas actually match — both are this one assertion."""
+    keys = {name: build(name).compatibility_key().hash() for name in sorted(_REGISTRY)}
+    assert len(set(keys.values())) == len(keys), f"two adapters share a key: {keys}"
+
+
+def test_whisper_is_offline_only_and_the_streaming_pair_is_not():
+    """Capability, not preference. Whisper's encoder consumes a fixed 30s
+    window, so `router.Pick` must filter it out of every online session —
+    that filter is the only thing keeping live traffic off it."""
+    assert not build("whisper_kv").capabilities().streaming
+    assert build("whisper_kv").capabilities().modes == frozenset({"offline"})
+    for name in ("zipformer_kv", "conformer_ctc_kv"):
+        assert build(name).capabilities().streaming, f"{name} must serve online sessions"

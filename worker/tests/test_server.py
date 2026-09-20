@@ -50,7 +50,11 @@ def test_open_push_flush_close_happy_path():
     push = r.json()
     assert push["generation"] == 1
     assert push["last_seq_applied"] == 10
-    assert push["text"] == "mock1"
+    # No text assertion: 320 samples of a constant byte pattern is not
+    # speech, and a real adapter correctly returns nothing for it. What
+    # this test is about is the PROTOCOL — generation advanced, the seq
+    # was applied — not transcription quality.
+    assert "text" in push
 
     r = client.post("/v1/stream/flush", json={"handle": handle})
     assert r.status_code == 200
@@ -70,7 +74,18 @@ def test_push_idempotent_replay_is_a_noop():
     first = client.post("/v1/stream/push", content=audio, headers=headers).json()
     replayed = client.post("/v1/stream/push", content=audio, headers=headers).json()
 
-    assert replayed == first, "replaying an applied seq range must be a byte-identical no-op"
+    # Compare the fields that DEFINE idempotency, not the whole body.
+    # `inference_ms` is a timing observation attached to work actually
+    # done; a replayed push does no inference, so it correctly has none —
+    # and asserting dict equality made a truthful response look like a
+    # violation. The property under test is that no state moved and the
+    # same transcript comes back.
+    for field in ("text", "last_seq_applied", "generation"):
+        assert replayed[field] == first[field], (
+            f"replaying an applied seq range changed {field}: "
+            f"{first[field]!r} -> {replayed[field]!r}"
+        )
+    assert "inference_ms" not in replayed, "a replayed push must not re-run inference"
     assert replayed["generation"] == first["generation"], "a replay must not bump generation (no re-infer happened)"
 
 
@@ -96,9 +111,10 @@ def test_push_unknown_handle_returns_404():
 
 
 def test_restore_round_trips_with_serializable_adapter():
-    from adapters.mock import MockState
-
-    st = MockState(session_id="orig", chunks_seen=3, tokens=["a", "b", "c"])
+    # Built by the adapter rather than by hand: a real KV state is 35
+    # tensors, not a dataclass anyone can construct in a test. That is the
+    # point — the blob under test is the one production would produce.
+    st = server.adapter.create_state("orig")
     blob = server.adapter.serialize(st)
 
     r = client.post("/v1/stream/restore", json={"checkpoint_blob": base64.b64encode(blob).decode()})
@@ -109,9 +125,7 @@ def test_restore_round_trips_with_serializable_adapter():
 
 
 def test_restore_carries_last_seq_applied_from_the_checkpoint():
-    from adapters.mock import MockState
-
-    st = MockState(session_id="orig", chunks_seen=1, tokens=["a"])
+    st = server.adapter.create_state("orig")
     blob = server.adapter.serialize(st)
 
     r = client.post(
@@ -144,7 +158,11 @@ def test_checkpoint_round_trips_through_push_and_restore():
         content=audio,
         headers={**AUDIO_HEADERS_CT, "X-Handle": handle, "X-Seq-Start": "0", "X-Seq-End": "10", "X-Expected-Generation": "0"},
     ).json()
-    assert push["text"] == "mock1"
+    # No text assertion: 320 samples of a constant byte pattern is not
+    # speech, and a real adapter correctly returns nothing for it. What
+    # this test is about is the PROTOCOL — generation advanced, the seq
+    # was applied — not transcription quality.
+    assert "text" in push
 
     cp = client.post("/v1/stream/checkpoint", json={"handle": handle})
     assert cp.status_code == 200
@@ -161,11 +179,16 @@ def test_checkpoint_round_trips_through_push_and_restore():
     assert restored_body["last_seq_applied"] == 10
     assert restored_body["handle"] != handle  # a genuinely new handle, not the same session
 
-    # Finalizing the RESTORED handle must reflect the pre-checkpoint
-    # history ("mock1"), proving state actually round-tripped rather than
-    # the restored handle starting fresh.
+    # The restored handle FLUSHES cleanly — that is what this test can
+    # honestly claim now. Its text is not asserted because the input is a
+    # constant byte pattern, not speech: a real adapter correctly
+    # transcribes nothing from it, where the mock returned a synthetic
+    # "mock1". Transcript identity ACROSS a restore is proven where it can
+    # be proven honestly — on real corpus audio, in
+    # tests/test_kvcache.py::test_restore_continues_identically.
     final = client.post("/v1/stream/flush", json={"handle": restored_body["handle"]})
-    assert final.json()["text"] == "mock1"
+    assert final.status_code == 200
+    assert "text" in final.json()
 
 
 def test_checkpoint_unknown_handle_returns_404():

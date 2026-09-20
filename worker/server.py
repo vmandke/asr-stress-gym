@@ -31,14 +31,16 @@ from statistics import median
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+import resources
 from adapters import pcm
 from adapters.base import NotSupported
 from adapters.registry import build as build_adapter
+from kvtier import KVTier, TierMiss, TierUnavailable
 from state import HandleNotFound, StaleGeneration, StateStore
 
 WORKER_ID = os.environ.get("WORKER_ID", "worker-unknown")
 MODEL = os.environ.get("MODEL", "unset")
-ADAPTER_NAME = os.environ.get("ADAPTER", "mock")
+ADAPTER_NAME = os.environ.get("ADAPTER", "zipformer_kv")
 PORT = int(os.environ.get("HEALTH_PORT", "9000"))
 
 # MODEL doubles as the mock adapter's identity (see adapters/mock.py) —
@@ -48,6 +50,12 @@ PORT = int(os.environ.get("HEALTH_PORT", "9000"))
 # adding a second knob that could drift from the first.
 adapter = build_adapter(ADAPTER_NAME, model_id=None if MODEL == "unset" else MODEL)
 store = StateStore()
+
+# The shared KV tier (cmd/kvtier), plus this worker's local hot cache in
+# front of it. Disabled and inert unless KVTIER_URL is set, so the default
+# stateful/pinned path is untouched — see worker/kvtier.py.
+tier = KVTier()
+
 STARTED_AT = time.time()
 
 # Rolling RTF window (inference wall-seconds / audio-seconds), reported at
@@ -58,6 +66,61 @@ STARTED_AT = time.time()
 # table in docs/RTF.md a fiction.
 _RTF_WINDOW = 64
 _rtf_samples: deque[float] = deque(maxlen=_RTF_WINDOW)
+
+# Real queue accounting, reported at /health as queue_depth and inflight.
+#
+# Both numbers exist because they answer different questions and diverge in
+# exactly the case that matters. `inflight` is inference requests accepted
+# and not yet answered; `running` is those actually executing inside
+# asyncio.to_thread's executor. Their difference is work that has arrived
+# and is WAITING, which is the only one of the three that means the worker
+# is oversubscribed rather than merely busy.
+#
+# Before M9 both of these were a hardcoded 0 in /health, which made the
+# router's queue-depth signal a constant and the dashboard's queue graph a
+# flat line. Unlike state_bytes — still honestly 0, because a real
+# adapter's state is an onnxruntime-owned C++ object Python cannot size
+# without guessing — this one is measurable from here, so it is measured.
+_inflight = 0
+_running = 0
+_inflight_high_water = 0
+
+
+class _Inflight:
+    """Counts one inference request across its whole handler.
+
+    A context manager rather than manual increments because every exit
+    path — a StaleGeneration 409, an HTTPException, a cancelled request
+    when the client disconnects mid-inference — must decrement. A leaked
+    increment here would make the worker report a queue that never drains
+    and get it ejected by the router for a bookkeeping bug.
+    """
+
+    def __enter__(self) -> "_Inflight":
+        global _inflight, _inflight_high_water
+        _inflight += 1
+        _inflight_high_water = max(_inflight_high_water, _inflight)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        global _inflight
+        _inflight -= 1
+        return None
+
+
+def _run_counted(fn, *args):
+    """Wrap the callable handed to asyncio.to_thread so `running` counts
+    time in the executor, not time in the handler."""
+
+    def inner():
+        global _running
+        _running += 1
+        try:
+            return fn(*args)
+        finally:
+            _running -= 1
+
+    return inner
 
 
 def _record_rtf(audio: bytes, elapsed_s: float) -> None:
@@ -80,6 +143,30 @@ _fault_429_rate = 0.0
 _fault_corrupt = False
 
 
+def _state_bytes() -> int:
+    """Total live inference state across this worker's sessions.
+
+    Was a hardcoded 0 through M10, honestly: a real adapter's state was an
+    onnxruntime-owned C++ object Python could not size, and a guessed
+    number feeding the router would be worse than a truthful zero. M11's
+    zipformer_kv owns its state as numpy arrays, so it can answer — and
+    adapters that still cannot simply do not implement state_bytes and
+    continue to report 0.
+    """
+    measure = getattr(adapter, "state_bytes", None)
+    if measure is None:
+        return 0
+    total = 0
+    for rec in store.all():
+        try:
+            total += int(measure(rec.model_state))
+        except Exception:
+            # Never let telemetry break a health check: an adapter that
+            # raises here would take the worker out of the fleet.
+            pass
+    return total
+
+
 @app.get("/health")
 def health() -> dict:
     return {
@@ -94,11 +181,54 @@ def health() -> dict:
         # (sherpa_onnx.OnlineStream) whose footprint Python cannot measure
         # without guessing, and a guessed number feeding the router's
         # memory-headroom filter (M7) would be worse than an honest zero.
-        "state_bytes": 0,
-        "queue_depth": 0,
+        "state_bytes": _state_bytes(),
+        # Accepted but not yet executing: the backlog. See _Inflight.
+        "queue_depth": max(0, _inflight - _running),
+        "inflight": _inflight,
+        "running": _running,
+        "inflight_high_water": _inflight_high_water,
         "rtf_p50": _rtf_p50(),
+        "uptime_s": round(time.time() - STARTED_AT, 1),
+        # Shared-tier locality, cumulative. This is where the gateway and
+        # the dashboard read the hit rate from, because Bifrost strips
+        # unknown fields out of the per-request response and cannot carry
+        # it. local_hits vs tier_hits is the measurement that says whether
+        # affinity is still worth preferring; see worker/kvtier.py.
+        # `url` is advertised, not configured gateway-side, for the same
+        # reason the compatibility key is: the gateway must never hold a
+        # second copy of the family->tier mapping that could drift from
+        # the fleet's own. Each family pool has its OWN tier, so that a
+        # burst in one family cannot evict another family's state.
+        "kv_tier": {"enabled": tier.enabled, "url": tier.base_url, **tier.stats},
+        **resources.snapshot(),
         "last_heartbeat_ms": int(time.time() * 1000),
     }
+
+
+@app.get("/v1/kv/layout")
+def kv_layout() -> dict:
+    """What this worker's KV cache actually contains, tensor by tensor.
+
+    Exists so a UI can show the cache rather than describe it: the answer
+    is derived from the ONNX graph (kvcache.StateLayout.describe), so it
+    cannot claim a tensor the model does not have or a size it does not
+    occupy. Adapters that own no such state simply do not implement
+    kv_layout and this reports `supported: false`.
+    """
+    describe = getattr(adapter, "kv_layout", None)
+    if describe is None:
+        return {"supported": False, "worker_id": WORKER_ID, "model": MODEL}
+    out = describe()
+    out.update({
+        "supported": True,
+        "worker_id": WORKER_ID,
+        "model": MODEL,
+        "compatibility_key_hash": adapter.compatibility_key().hash(),
+        "cache_schema_version": adapter.compatibility_key().cache_schema_version,
+        "live_state_bytes": _state_bytes(),
+        "active_sessions": store.count(),
+    })
+    return out
 
 
 @app.post("/v1/stream/open")
@@ -137,6 +267,10 @@ async def stream_push(request: Request):
     # Idempotent replay (docs/PROTOCOL.md "last_seq_applied"): audio at or
     # below what's already applied is a no-op, not a re-infer. This is
     # what makes the coordinator's replay-on-failover safe to call freely.
+    #
+    # Counted BEFORE the inflight guard on purpose: a replayed push does no
+    # inference and must not appear in the queue depth, or a failover storm
+    # would read as backlog on a worker that is doing nothing.
     if seq_end <= rec.last_seq_applied:
         return {
             "text": rec.last_text,
@@ -153,9 +287,11 @@ async def stream_push(request: Request):
     # so distinct sessions decoding at once is the adapters' intended
     # usage; the two non-streaming ones additionally serialize themselves
     # (adapters/buffered.py).
-    started = time.perf_counter()
-    delta, next_state = await asyncio.to_thread(adapter.infer, audio, rec.model_state)
-    _record_rtf(audio, time.perf_counter() - started)
+    with _Inflight():
+        started = time.perf_counter()
+        delta, next_state = await asyncio.to_thread(_run_counted(adapter.infer, audio, rec.model_state))
+        inference_s = time.perf_counter() - started
+    _record_rtf(audio, inference_s)
 
     try:
         rec = store.compare_and_commit(
@@ -168,7 +304,16 @@ async def stream_push(request: Request):
     except StaleGeneration:
         return JSONResponse(status_code=409, content={"error": "stale_generation"})
 
-    return {"text": rec.last_text, "last_seq_applied": rec.last_seq_applied, "generation": rec.generation}
+    # Additive timing evidence for M8. The gateway deliberately ignores
+    # unknown backend fields, so this does not put a benchmark concern on
+    # the streaming contract; direct benchmark probes can nevertheless
+    # distinguish model service time from their own HTTP timing.
+    return {
+        "text": rec.last_text,
+        "last_seq_applied": rec.last_seq_applied,
+        "generation": rec.generation,
+        "inference_ms": round(inference_s * 1000, 3),
+    }
 
 
 @app.post("/v1/stream/flush")
@@ -181,7 +326,8 @@ async def stream_flush(request: Request) -> dict:
     # Off the event loop for the same reason as push, and more so: on the
     # non-streaming adapters finalize IS the inference (adapters/buffered.py),
     # so this is the single most expensive call the worker makes.
-    delta = await asyncio.to_thread(adapter.finalize, rec.model_state)
+    with _Inflight():
+        delta = await asyncio.to_thread(_run_counted(adapter.finalize, rec.model_state))
     return {"text": delta.text, "final": True}
 
 
@@ -193,24 +339,47 @@ async def audio_transcriptions(
     file: UploadFile = File(...),
     model: str = Form(default=""),
     response_format: str = Form(default="json"),
+    state_ref: str = Form(default=""),
+    state_sink: str = Form(default=""),
+    kv_mode: str = Form(default=""),
 ):
     """OpenAI's transcription shape, so Bifrost can route to this worker as
     an ordinary provider (docs/build-plan.md, "The Bifrost boundary").
 
-    **Stateless by construction, and that is the whole point.** Every other
-    endpoint on this worker is part of a stateful session: `push` carries a
-    handle and an expected generation, and the worker holds inference state
-    keyed by that handle. Bifrost load-balances and fails over between
-    providers, so a stateful call routed through it could land chunk N on
-    one worker and chunk N+1 on another — the second holding no state, and
-    the gateway never learning the model changed underneath it. That is
-    precisely the silent corruption this project exists to prevent, which
-    is why only complete-utterance requests come through here.
+    Two behaviours share this one endpoint, because this is the ONLY shape
+    Bifrost will route. Which one runs depends on `kv_mode`.
 
-    So this creates fresh state, runs the whole buffer through it, finalizes
-    and throws the state away. Nothing survives the request. Every adapter
-    supports it, including the non-streaming ones — for those, `finalize`
-    IS the inference (adapters/buffered.py).
+    **kv_mode absent — one-shot, stateless.** Creates fresh state, runs the
+    whole buffer through it, finalizes, throws the state away. Nothing
+    survives the request. This is the offline-final path.
+
+    **kv_mode set — shared-tier streaming.** The request carries a
+    *reference* to state held in the shared KV tier (cmd/kvtier) rather
+    than the state itself, and names the reference its output should be
+    published under. The worker resolves `state_ref` (locally if it wrote
+    it last, otherwise fetching from the tier), runs one chunk, and
+    publishes the result under `state_sink`.
+
+    That is what lets a load balancer route a session's chunks to ANY
+    worker in the model family: nothing the session needs lives inside a
+    particular worker process any more. See worker/kvtier.py for why a
+    local hot cache is part of this rather than an optimization bolted on
+    after, and docs/BIFROST-KVCACHE.md for the measurement that rules out
+    the obvious alternative of shipping the tensors in the request.
+
+    **Why these are form fields.** Measured against Bifrost: unknown
+    multipart request fields are forwarded to the provider verbatim, while
+    unknown RESPONSE fields are stripped — Bifrost parses provider
+    responses into its own normalized schema. So state can travel IN
+    through Bifrost but cannot come back OUT. The design avoids needing it
+    to: the caller names the output reference up front, so the response
+    carries nothing but text.
+
+    That same stripping is why a cache miss is signalled as an HTTP STATUS
+    rather than a response field. Status codes survive, and a miss genuinely
+    means this provider cannot serve the request — so letting Bifrost try
+    the next one, and ultimately surfacing the failure to the gateway, is
+    the correct behaviour rather than a workaround.
     """
     raw = await file.read()
     try:
@@ -218,21 +387,86 @@ async def audio_transcriptions(
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
-    def run() -> str:
-        st = adapter.create_state(f"oai-{uuid.uuid4().hex[:8]}")
-        _, st = adapter.infer(pcm_bytes, st)
-        return adapter.finalize(st).text
+    if not kv_mode:
+        def run() -> str:
+            st = adapter.create_state(f"oai-{uuid.uuid4().hex[:8]}")
+            _, st = adapter.infer(pcm_bytes, st)
+            return adapter.finalize(st).text
 
-    started = time.perf_counter()
-    text = await asyncio.to_thread(run)
-    _record_rtf(pcm_bytes, time.perf_counter() - started)
+        with _Inflight():
+            started = time.perf_counter()
+            text = await asyncio.to_thread(_run_counted(run))
+            _record_rtf(pcm_bytes, time.perf_counter() - started)
+
+        if response_format == "text":
+            return PlainTextResponse(text)
+        # OpenAI returns {"text": ...}; the extra fields are additive and let
+        # a caller see WHICH backend answered, which matters when Bifrost is
+        # the thing that chose it. (Bifrost strips them; a direct call sees
+        # them, and the chaos/bench scripts call directly for that reason.)
+        return {"text": text, "model": model or MODEL, "worker_id": WORKER_ID}
+
+    if kv_mode not in ("stream", "final"):
+        return JSONResponse(status_code=400, content={"error": f"unknown kv_mode {kv_mode!r}"})
+    if not tier.enabled:
+        return JSONResponse(status_code=503, content={"error": "kv tier not configured"})
+    if not adapter.capabilities().serializable:
+        return JSONResponse(status_code=501, content={"error": "not_supported"})
+
+    compat = adapter.compatibility_key().hash()
+    outcome: dict = {}
+
+    def run_stateful() -> str:
+        if state_ref:
+            st, outcome["hit"] = tier.load(state_ref, adapter, compat)
+        else:
+            # No predecessor: the first chunk of a session.
+            st, outcome["hit"] = adapter.create_state(f"kv-{uuid.uuid4().hex[:8]}"), "fresh"
+        delta, st = adapter.infer(pcm_bytes, st)
+        text = delta.text
+        if kv_mode == "final":
+            text = adapter.finalize(st).text
+        if state_sink:
+            outcome["bytes"] = tier.store(state_sink, st, adapter, compat)
+        return text
+
+    try:
+        with _Inflight():
+            started = time.perf_counter()
+            text = await asyncio.to_thread(_run_counted(run_stateful))
+            _record_rtf(pcm_bytes, time.perf_counter() - started)
+    except TierMiss:
+        # The reference resolved nowhere: evicted, expired, or the tier
+        # lost it. Serving this chunk against fresh state would silently
+        # drop the session's accumulated context and produce a plausible
+        # but wrong transcript. Refusing is what lets the caller replay.
+        return JSONResponse(
+            status_code=424,
+            content={"error": "state_ref_miss", "state_ref": state_ref, "worker_id": WORKER_ID},
+        )
+    except ValueError as e:
+        # Compatibility-key mismatch — a blob from another model family.
+        # 422 for the same reason /v1/stream/restore uses it: refuse,
+        # never coerce.
+        return JSONResponse(
+            status_code=422,
+            content={"error": "incompatible_state", "detail": str(e), "worker_id": WORKER_ID},
+        )
+    except TierUnavailable as e:
+        return JSONResponse(status_code=503, content={"error": "kv_tier_unavailable", "detail": str(e)})
 
     if response_format == "text":
         return PlainTextResponse(text)
-    # OpenAI returns {"text": ...}; the extra fields are additive and let a
-    # caller see WHICH backend answered, which matters when Bifrost is the
-    # thing that chose it.
-    return {"text": text, "model": model or MODEL, "worker_id": WORKER_ID}
+    return {
+        "text": text,
+        "model": model or MODEL,
+        "worker_id": WORKER_ID,
+        # Stripped by Bifrost, visible on a direct call. Cumulative
+        # equivalents are on /health, which is how the gateway and the
+        # dashboard actually observe locality.
+        "kv_hit": outcome.get("hit", ""),
+        "kv_bytes": outcome.get("bytes", 0),
+    }
 
 
 def _to_pcm(raw: bytes) -> bytes:

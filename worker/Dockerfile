@@ -24,8 +24,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 COPY worker/pyproject.toml ./
-COPY worker/server.py worker/state.py worker/supervisor.py ./
+COPY worker/server.py worker/state.py worker/supervisor.py worker/resources.py worker/kvtier.py ./
 COPY worker/adapters ./adapters
+COPY worker/kvcache ./kvcache
 
 # fastapi/uvicorn for the HTTP surface (docs/PROTOCOL.md); sherpa-onnx,
 # faster-whisper and ctranslate2 for the real adapters. All five adapters'

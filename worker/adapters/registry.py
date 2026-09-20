@@ -19,21 +19,25 @@ import importlib
 
 from .base import Adapter
 
-# name -> (module, class). The mock is listed first because it is the
-# fleet's only serializable adapter and therefore the only place the warm-
-# checkpoint tier is real (docs/DECISIONS.md, "Checkpoint tier").
+# name -> (module, class). Every adapter here owns a real, serializable
+# KV cache (worker/kvcache). The sherpa-onnx-wrapped adapters and the mock
+# moved to deprecated_experiments/ once every deployed worker had one:
+# they could not serialize state, so they only ever exercised the
+# DEGRADATION path, and keeping them in the registry implied a choice the
+# fleet no longer offers.
 _REGISTRY: dict[str, tuple[str, str]] = {
-    "mock": ("adapters.mock", "MockAdapter"),
-    "zipformer": ("adapters.zipformer", "ZipformerAdapter"),
-    "conformer_ctc": ("adapters.conformer_ctc", "ConformerCtcAdapter"),
-    "whisper_ct2": ("adapters.whisper_ct2", "WhisperCT2Adapter"),
-    "whisper_onnx": ("adapters.whisper_onnx", "WhisperOnnxAdapter"),
+    # streaming transducer — 35 state tensors incl. cached_key/cached_val
+    "zipformer_kv": ("adapters.zipformer_kv", "ZipformerKVAdapter"),
+    # streaming CTC — NeMo cache_last_channel / cache_last_time
+    "conformer_ctc_kv": ("adapters.conformer_ctc_kv", "ConformerCtcKVAdapter"),
+    # offline encoder-decoder — a textbook self-attention KV cache
+    "whisper_kv": ("adapters.whisper_kv", "WhisperKVAdapter"),
 }
 
 # The adapters that load baked-in weights (models/fetch.sh). The
 # conformance suite skips these when no weights root exists, rather than
 # reporting a fresh clone as a broken fleet.
-NEEDS_WEIGHTS = frozenset({"zipformer", "conformer_ctc", "whisper_ct2", "whisper_onnx"})
+NEEDS_WEIGHTS = frozenset({"zipformer_kv", "conformer_ctc_kv", "whisper_kv"})
 
 
 def build(name: str, *, model_id: str | None = None) -> Adapter:

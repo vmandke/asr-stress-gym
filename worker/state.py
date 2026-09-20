@@ -93,3 +93,13 @@ class StateStore:
     def count(self) -> int:
         with self._registry_lock:
             return len(self._records)
+
+    def all(self) -> list:
+        """A snapshot of the live records, for read-only telemetry.
+
+        Returns a copied list rather than the live dict so a caller
+        iterating it cannot be tripped by a concurrent open/close — the
+        records themselves are shared, which is fine for reading a size.
+        """
+        with self._registry_lock:
+            return list(self._records.values())
