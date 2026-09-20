@@ -103,6 +103,8 @@ container's own port is unaffected either way.
   happens to a stream of audio, end to end: chunking, dispatch, where every
   piece of state lives, what each step costs. Written from measured output,
   not prose.
+- [`docs/BIFROST-KVCACHE.md`](docs/BIFROST-KVCACHE.md) — why Bifrost is used
+  for stateless transcription work but cannot own a live ASR KV cache.
 - [`docs/BENCH.md`](docs/BENCH.md) — the frozen `cmd/loadgen` contract and
   the corpus's clip kinds.
 - [`docs/RTF.md`](docs/RTF.md) — measured real-time factor per adapter,

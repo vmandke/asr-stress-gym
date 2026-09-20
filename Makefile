@@ -1,4 +1,4 @@
-.PHONY: check up down build smoke test test-go test-worker models rtf corpus inspect-chunks inspect-trace inspect-fleet vad-economics matrix demo chaos bench
+.PHONY: check up down build smoke test test-go test-worker models rtf corpus inspect-chunks inspect-trace inspect-fleet vad-economics bifrost-offline bifrost-fallback matrix demo chaos bench
 
 # Available now (M0-M1).
 check:
@@ -75,6 +75,14 @@ corpus:
 # What does gating silence actually save? Needs a running stack.
 vad-economics:
 	./scripts/vad_economics.sh
+
+# Runnable Bifrost examples. Both use a complete WAV request; neither routes
+# a stateful streaming handle through Bifrost — see docs/BIFROST-KVCACHE.md.
+bifrost-offline:
+	./scripts/bifrost_offline.sh
+
+bifrost-fallback:
+	./scripts/bifrost_fallback.sh
 
 # Land at their milestone (docs/implementation-plan.md). Each fails loudly
 # rather than pretending to pass, so `make <target>` is always an honest

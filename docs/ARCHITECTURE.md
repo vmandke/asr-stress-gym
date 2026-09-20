@@ -513,6 +513,10 @@ straight back to the worker that just refused.
 
 ## 10. The Bifrost boundary
 
+For the full distinction between Bifrost response routing and a worker's live
+inference/KV cache, including the safe design if stateful Bifrost routing is
+ever made a hard requirement, see [BIFROST-KVCACHE.md](BIFROST-KVCACHE.md).
+
 ```
 partials during speech  ──▶ DIRECT to the pinned worker   stateful, latency-critical
 online finals           ──▶ DIRECT by default             hot state exists — see below
@@ -573,7 +577,8 @@ exact failure this system exists to prevent.
 
 ```bash
 make up                                  # no Bifrost; finals go direct
-docker compose --profile bifrost up -d   # Bifrost on :8080
+BIFROST_URL=http://bifrost:8080 docker compose --profile bifrost up -d --build
+                                         # Bifrost on :8080; gateway routes eligible finals through it
 ```
 
 The gateway reads `BIFROST_URL`. Unset builds a `nil` client and every final

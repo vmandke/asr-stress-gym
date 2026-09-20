@@ -16,16 +16,33 @@ True of the **audio**, false of the **worker** — which by then holds
 accumulated encoder and predictor context built from exactly that audio.
 `/v1/audio/transcriptions` is stateless by construction and throws it away.
 
+For the complete design rationale — including why a Bifrost response cache,
+provider fallback, or a model prefix cache cannot stand in for a live ASR KV
+cache — see [Bifrost and KV cache](../docs/BIFROST-KVCACHE.md).
+
 ## Off by default
 
 ```bash
 make up                                  # no Bifrost; finals go direct
-docker compose --profile bifrost up -d   # Bifrost on :8080, gateway routes finals through it
+BIFROST_URL=http://bifrost:8080 docker compose --profile bifrost up -d --build
+                                         # Bifrost on :8080; gateway routes eligible finals through it
 ```
 
 The gateway reads `BIFROST_URL`. Unset means the client is `nil` and every
 final takes the direct path — which is also what happens on *any* Bifrost
 failure. Enabling it can cost latency; it cannot cost a transcript.
+
+## Runnable examples
+
+```bash
+make bifrost-offline   # one complete WAV through Bifrost
+make bifrost-fallback  # kill worker-a; verify Bifrost uses worker-b fallback
+```
+
+Both scripts start the `bifrost` Compose profile, leave the local stack
+running for inspection, and operate only on complete WAV requests. The
+fallback example restores worker-a before it exits. They are examples of the
+safe Bifrost boundary, not examples of streaming through Bifrost.
 
 ## All five workers, each its own provider
 
