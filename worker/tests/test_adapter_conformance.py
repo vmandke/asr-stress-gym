@@ -157,9 +157,9 @@ def test_every_registered_adapter_owns_a_kv_cache():
 
     Every deployed adapter drives its model's ONNX graphs directly and owns
     the state tensors, so all of them can checkpoint. The sherpa-wrapped
-    adapters and the mock moved to deprecated_experiments/ once that was
-    true of every worker: they could only ever exercise the degradation
-    path, and an adapter that silently reappeared claiming
+    adapters and the mock were removed once that was true of every worker:
+    they could only ever exercise the degradation path, and an adapter
+    that silently reappeared claiming
     serializable=False would make `checkpoint_degraded_total` ambiguous
     again — is this a cross-model failover, or a worker that simply cannot
     checkpoint?

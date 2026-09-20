@@ -21,10 +21,10 @@ from .base import Adapter
 
 # name -> (module, class). Every adapter here owns a real, serializable
 # KV cache (worker/kvcache). The sherpa-onnx-wrapped adapters and the mock
-# moved to deprecated_experiments/ once every deployed worker had one:
-# they could not serialize state, so they only ever exercised the
-# DEGRADATION path, and keeping them in the registry implied a choice the
-# fleet no longer offers.
+# were removed once every deployed worker had one: they could not
+# serialize state, so they only ever exercised the DEGRADATION path, and
+# keeping them in the registry implied a choice the fleet no longer
+# offers. They remain in git history if a comparison ever needs them.
 _REGISTRY: dict[str, tuple[str, str]] = {
     # streaming transducer — 35 state tensors incl. cached_key/cached_val
     "zipformer_kv": ("adapters.zipformer_kv", "ZipformerKVAdapter"),
