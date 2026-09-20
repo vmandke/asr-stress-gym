@@ -4,10 +4,10 @@
     "enable_logging": true
   },
   "providers": {
-    "worker-mock": {
+    "worker-zip-1": {
       "keys": [
         {
-          "name": "worker-mock-local",
+          "name": "worker-zip-1-local",
           "value": "dummy-local-no-auth",
           "models": [
             "*"
@@ -16,17 +16,22 @@
         }
       ],
       "network_config": {
-        "base_url": "http://worker-mock:9000",
-        "allow_private_network": true
+        "base_url": "http://worker-zip-1:9000",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 5,
+        "max_retries": 1,
+        "retry_backoff_initial_seconds": 0.1,
+        "retry_backoff_max_seconds": 1
       },
       "custom_provider_config": {
         "base_provider_type": "openai"
-      }
+      },
+      "_comment": "zipformer transducer: 53ms mean, streaming encoder"
     },
-    "worker-a": {
+    "worker-zip-2": {
       "keys": [
         {
-          "name": "worker-a-local",
+          "name": "worker-zip-2-local",
           "value": "dummy-local-no-auth",
           "models": [
             "*"
@@ -35,17 +40,22 @@
         }
       ],
       "network_config": {
-        "base_url": "http://worker-a:9000",
-        "allow_private_network": true
+        "base_url": "http://worker-zip-2:9000",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 5,
+        "max_retries": 1,
+        "retry_backoff_initial_seconds": 0.1,
+        "retry_backoff_max_seconds": 1
       },
       "custom_provider_config": {
         "base_provider_type": "openai"
-      }
+      },
+      "_comment": "zipformer transducer: 53ms mean, streaming encoder"
     },
-    "worker-b": {
+    "worker-ctc-1": {
       "keys": [
         {
-          "name": "worker-b-local",
+          "name": "worker-ctc-1-local",
           "value": "dummy-local-no-auth",
           "models": [
             "*"
@@ -54,17 +64,22 @@
         }
       ],
       "network_config": {
-        "base_url": "http://worker-b:9000",
-        "allow_private_network": true
+        "base_url": "http://worker-ctc-1:9000",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 5,
+        "max_retries": 1,
+        "retry_backoff_initial_seconds": 0.1,
+        "retry_backoff_max_seconds": 1
       },
       "custom_provider_config": {
         "base_provider_type": "openai"
-      }
+      },
+      "_comment": "FastConformer CTC: 71ms mean (373ms cold)"
     },
-    "worker-c": {
+    "worker-ctc-2": {
       "keys": [
         {
-          "name": "worker-c-local",
+          "name": "worker-ctc-2-local",
           "value": "dummy-local-no-auth",
           "models": [
             "*"
@@ -73,17 +88,22 @@
         }
       ],
       "network_config": {
-        "base_url": "http://worker-c:9000",
-        "allow_private_network": true
+        "base_url": "http://worker-ctc-2:9000",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 5,
+        "max_retries": 1,
+        "retry_backoff_initial_seconds": 0.1,
+        "retry_backoff_max_seconds": 1
       },
       "custom_provider_config": {
         "base_provider_type": "openai"
-      }
+      },
+      "_comment": "FastConformer CTC: 71ms mean (373ms cold)"
     },
-    "worker-d": {
+    "worker-whisper-1": {
       "keys": [
         {
-          "name": "worker-d-local",
+          "name": "worker-whisper-1-local",
           "value": "dummy-local-no-auth",
           "models": [
             "*"
@@ -92,12 +112,41 @@
         }
       ],
       "network_config": {
-        "base_url": "http://worker-d:9000",
-        "allow_private_network": true
+        "base_url": "http://worker-whisper-1:9000",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 12,
+        "max_retries": 1,
+        "retry_backoff_initial_seconds": 0.1,
+        "retry_backoff_max_seconds": 1
       },
       "custom_provider_config": {
         "base_provider_type": "openai"
-      }
+      },
+      "_comment": "Whisper: ~290ms mean \u2014 a 30s-window encode plus autoregressive decode"
+    },
+    "worker-whisper-2": {
+      "keys": [
+        {
+          "name": "worker-whisper-2-local",
+          "value": "dummy-local-no-auth",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0
+        }
+      ],
+      "network_config": {
+        "base_url": "http://worker-whisper-2:9000",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 12,
+        "max_retries": 1,
+        "retry_backoff_initial_seconds": 0.1,
+        "retry_backoff_max_seconds": 1
+      },
+      "custom_provider_config": {
+        "base_provider_type": "openai"
+      },
+      "_comment": "Whisper: ~290ms mean \u2014 a 30s-window encode plus autoregressive decode"
     }
   },
   "config_store": {

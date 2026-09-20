@@ -49,11 +49,16 @@ type workerRef struct {
 
 func defaultFleet() map[string]workerRef {
 	return map[string]workerRef{
-		"worker-mock": {id: "worker-mock", healthURL: envOr("WORKER_MOCK_URL", "http://localhost:18000"), adminURL: envOr("WORKER_MOCK_ADMIN_URL", "http://localhost:19000")},
-		"worker-a":    {id: "worker-a", healthURL: envOr("WORKER_A_URL", "http://localhost:18001"), adminURL: envOr("WORKER_A_ADMIN_URL", "http://localhost:19001")},
-		"worker-b":    {id: "worker-b", healthURL: envOr("WORKER_B_URL", "http://localhost:18002"), adminURL: envOr("WORKER_B_ADMIN_URL", "http://localhost:19002")},
-		"worker-c":    {id: "worker-c", healthURL: envOr("WORKER_C_URL", "http://localhost:18003"), adminURL: envOr("WORKER_C_ADMIN_URL", "http://localhost:19003")},
-		"worker-d":    {id: "worker-d", healthURL: envOr("WORKER_D_URL", "http://localhost:18004"), adminURL: envOr("WORKER_D_ADMIN_URL", "http://localhost:19004")},
+		"worker-a": {id: "worker-a", healthURL: envOr("WORKER_A_URL", "http://localhost:18001"), adminURL: envOr("WORKER_A_ADMIN_URL", "http://localhost:19001")},
+		"worker-b": {id: "worker-b", healthURL: envOr("WORKER_B_URL", "http://localhost:18002"), adminURL: envOr("WORKER_B_ADMIN_URL", "http://localhost:19002")},
+		"worker-c": {id: "worker-c", healthURL: envOr("WORKER_C_URL", "http://localhost:18003"), adminURL: envOr("WORKER_C_ADMIN_URL", "http://localhost:19003")},
+		// The KV pair (M11), behind the `kv` compose profile. Listed
+		// unconditionally: scenarios 12/13 probe whether they answer and
+		// SKIP if they do not, which is cheaper and clearer than making
+		// the fleet map itself conditional on a profile.
+		"worker-f": {id: "worker-f", healthURL: envOr("WORKER_F_URL", "http://localhost:18007"), adminURL: envOr("WORKER_F_ADMIN_URL", "http://localhost:19007")},
+		"worker-g": {id: "worker-g", healthURL: envOr("WORKER_G_URL", "http://localhost:18008"), adminURL: envOr("WORKER_G_ADMIN_URL", "http://localhost:19008")},
+		"worker-h": {id: "worker-h", healthURL: envOr("WORKER_H_URL", "http://localhost:18009"), adminURL: envOr("WORKER_H_ADMIN_URL", "http://localhost:19009")},
 	}
 }
 
@@ -96,7 +101,7 @@ func main() {
 			log.Fatalf("openSession: %v", err)
 		}
 		log.Printf("session_id=%s", s.sessionID)
-		for _, id := range []string{"worker-mock", "worker-a", "worker-b", "worker-c", "worker-d"} {
+		for _, id := range []string{"worker-zip-1", "worker-zip-2", "worker-ctc-1", "worker-ctc-2", "worker-whisper-1", "worker-whisper-2"} {
 			n, err := activeSessions(fleet[id].healthURL)
 			log.Printf("%s: active_sessions=%d err=%v", id, n, err)
 		}
@@ -122,8 +127,20 @@ func main() {
 		err = scenario10LongSilence(*wsURL, *gatewayURL, fleet)
 	case 11:
 		err = scenario11AllBackendsDown(*wsURL, *gatewayURL, fleet)
+	case 12:
+		err = scenario12KVCheckpointRestore(*wsURL, *gatewayURL, *clipPath, fleet)
+	case 13:
+		err = scenario13CorruptKVCheckpointDegrades(*wsURL, *gatewayURL, *clipPath, fleet)
 	default:
-		log.Fatalf("--scenario must be one of 2, 3, 4, 5, 6, 7, 10, 11 (got %d). Scenario 9 (overload) is scripts/scenarios/09_overload.sh — it needs the gateway restarted with a lowered capacity envelope, which is a shell concern", *scenario)
+		log.Fatalf("--scenario must be one of 2, 3, 4, 5, 6, 7, 10, 11, 12, 13 (got %d). Scenario 9 (overload) is scripts/scenarios/09_overload.sh — it needs the gateway restarted with a lowered capacity envelope, which is a shell concern", *scenario)
+	}
+	if isSkip(err) {
+		// A precondition was absent (e.g. the kv profile is not running).
+		// Not a failure: a fleet that was never asked to start those
+		// workers is not a broken fleet, and exiting non-zero here would
+		// make `make chaos` fail for the default profile.
+		log.Printf("SKIP scenario %d: %v", *scenario, err)
+		return
 	}
 	if err != nil {
 		log.Printf("FAIL scenario %d: %v", *scenario, err)
@@ -323,6 +340,55 @@ func (s *wsSession) readLoop(ctx context.Context) {
 		}
 		s.events <- ev
 	}
+}
+
+// openSessionMode opens a session in an explicit mode. `openSession` is
+// the online shorthand; offline sessions are the only class routed
+// through Bifrost, so scenario 16 needs to ask for one directly.
+func openSessionMode(ctx context.Context, wsURL, mode string) (*wsSession, error) {
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	s := &wsSession{conn: conn, events: make(chan map[string]any, 256), readErrs: make(chan error, 1)}
+	go s.readLoop(ctx)
+
+	start := fmt.Sprintf(`{"type":"session.start","mode":%q,"sample_rate_hz":16000,"encoding":"pcm_s16le","channels":1,"nominal_frame_ms":20}`, mode)
+	if err := s.writeFrame(ctx, wire.Frame{Type: wire.MsgControl, Seq: 0, Payload: []byte(start)}); err != nil {
+		return nil, fmt.Errorf("send session.start: %w", err)
+	}
+	ack, err := s.nextOfType(ctx, 15*time.Second, "ack", "overloaded", "error")
+	if err != nil {
+		return nil, err
+	}
+	if ack["type"] != "ack" {
+		return nil, fmt.Errorf("got %v after session.start, want ack", ack)
+	}
+	s.sessionID, _ = ack["session_id"].(string)
+	if s.sessionID == "" {
+		return nil, fmt.Errorf("ack carried no session_id: %v", ack)
+	}
+	return s, nil
+}
+
+// restoreWorker respawns a killed worker child and waits for it to SERVE.
+// /admin/restore returns when the process is spawned, not when it is
+// listening — a real adapter then loads weights — so polling /health is
+// the difference between a reliable scenario and an intermittent one.
+func restoreWorker(w workerRef) error {
+	resp, err := http.Post(w.adminURL+"/admin/restore", "application/json", nil)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := activeSessions(w.healthURL); err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("%s did not start serving within 60s", w.id)
 }
 
 func openSession(ctx context.Context, wsURL string) (*wsSession, error) {

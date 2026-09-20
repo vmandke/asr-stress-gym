@@ -49,7 +49,6 @@ restore_all_workers() {
   restore_worker "${WORKER_B_ADMIN_URL:-http://localhost:19002}" "${WORKER_B_URL:-http://localhost:18002}"
   restore_worker "${WORKER_C_ADMIN_URL:-http://localhost:19003}" "${WORKER_C_URL:-http://localhost:18003}"
   restore_worker "${WORKER_D_ADMIN_URL:-http://localhost:19004}" "${WORKER_D_URL:-http://localhost:18004}"
-  restore_worker "${WORKER_MOCK_ADMIN_URL:-http://localhost:19000}" "${WORKER_MOCK_URL:-http://localhost:18000}"
 }
 
 reset_fleet_for_scenario() {

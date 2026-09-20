@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"time"
 )
 
@@ -20,9 +22,9 @@ func scenario2SameModelCrash(wsURL, gatewayURL, clipPath string, fleet map[strin
 	if err != nil {
 		return err
 	}
-	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-a"], fleet["worker-b"])
+	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-zip-1"], fleet["worker-zip-2"])
 	if err != nil {
-		return fmt.Errorf("could not get a session pinned to worker-a or worker-b: %w", err)
+		return fmt.Errorf("could not get a session pinned to worker-zip-1 or worker-zip-2: %w", err)
 	}
 
 	mid := evenMidpoint(clip.PCM)
@@ -37,6 +39,7 @@ func scenario2SameModelCrash(wsURL, gatewayURL, clipPath string, fleet map[strin
 		return fmt.Errorf("fetch baseline metrics: %w", err)
 	}
 
+	recoveryStarted := time.Now()
 	if err := killWorker(pinned); err != nil {
 		return fmt.Errorf("kill %s: %w", pinned.id, err)
 	}
@@ -73,7 +76,8 @@ func scenario2SameModelCrash(wsURL, gatewayURL, clipPath string, fleet map[strin
 	// even attempted on a worker that shares the key.
 	warmBefore := before.CheckpointRestoresTotal + before.CheckpointDegradedTotal
 	warmAfter := after.CheckpointRestoresTotal + after.CheckpointDegradedTotal
-	if warmAfter <= warmBefore {
+	checkpointsEnabled := os.Getenv("CHECKPOINTS_ENABLED") != "0"
+	if checkpointsEnabled && warmAfter <= warmBefore {
 		return fmt.Errorf("neither checkpoint_restores_total nor checkpoint_degraded_total moved (%d -> %d) — a same-model failover must at least ATTEMPT the warm tier",
 			warmBefore, warmAfter)
 	}
@@ -85,6 +89,11 @@ func scenario2SameModelCrash(wsURL, gatewayURL, clipPath string, fleet map[strin
 	if text, _ := final["text"].(string); text == "" {
 		return fmt.Errorf("final carried empty text after same-model recovery")
 	}
+	mode := "cold_replay"
+	if after.CheckpointRestoresTotal > before.CheckpointRestoresTotal {
+		mode = "checkpoint"
+	}
+	log.Printf("BENCH recovery_mode=%s recovery_ms=%.3f", mode, float64(time.Since(recoveryStarted).Microseconds())/1000)
 	return nil
 }
 
@@ -99,9 +108,9 @@ func scenario3CrossModelCrash(wsURL, gatewayURL, clipPath string, fleet map[stri
 	if err != nil {
 		return err
 	}
-	s, _, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-a"], fleet["worker-b"])
+	s, _, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-zip-1"], fleet["worker-zip-2"])
 	if err != nil {
-		return fmt.Errorf("could not get a session pinned to worker-a or worker-b: %w", err)
+		return fmt.Errorf("could not get a session pinned to worker-zip-1 or worker-zip-2: %w", err)
 	}
 
 	mid := evenMidpoint(clip.PCM)
@@ -120,10 +129,11 @@ func scenario3CrossModelCrash(wsURL, gatewayURL, clipPath string, fleet map[stri
 	// real; the other dies too so NO same-key candidate survives, forcing
 	// a genuinely cross-model recovery rather than leaving it to chance
 	// which one the router would have preferred.
-	if err := killWorker(fleet["worker-a"]); err != nil {
-		return fmt.Errorf("kill worker-a: %w", err)
+	recoveryStarted := time.Now()
+	if err := killWorker(fleet["worker-zip-1"]); err != nil {
+		return fmt.Errorf("kill the pinned worker: %w", err)
 	}
-	if err := killWorker(fleet["worker-b"]); err != nil {
+	if err := killWorker(fleet["worker-zip-2"]); err != nil {
 		return fmt.Errorf("kill worker-b: %w", err)
 	}
 
@@ -155,6 +165,7 @@ func scenario3CrossModelCrash(wsURL, gatewayURL, clipPath string, fleet map[stri
 	if text, _ := final["text"].(string); text == "" {
 		return fmt.Errorf("final carried empty text after cross-model recovery — finals must be preserved")
 	}
+	log.Printf("BENCH recovery_mode=cross_model_replay recovery_ms=%.3f", float64(time.Since(recoveryStarted).Microseconds())/1000)
 	return nil
 }
 
@@ -177,7 +188,7 @@ func scenario5CorruptCheckpoint(wsURL, gatewayURL, clipPath string, fleet map[st
 	// heterogeneous fleet it made this scenario a coin flip between mock and
 	// a permanent 501 from a real adapter. Pin deliberately to the warm tier
 	// the scenario is testing.
-	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-mock"])
+	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-zip-1"], fleet["worker-zip-2"])
 	if err != nil {
 		return err
 	}

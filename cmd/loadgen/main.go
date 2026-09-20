@@ -64,6 +64,7 @@ type config struct {
 	wsURL          string
 	out            string
 	seed           int64
+	controlAddr    string // M9: serve the control API instead of running one batch
 }
 
 // event is one row of the CSV in docs/BENCH.md. Streams produce these on
@@ -152,7 +153,22 @@ func main() {
 	flag.StringVar(&cfg.wsURL, "ws-url", envOr("GATEWAY_WS_URL", "ws://localhost:7070/ws"), "gateway WebSocket URL")
 	flag.StringVar(&cfg.out, "out", "", "write the event CSV here (omit for summary only)")
 	flag.Int64Var(&cfg.seed, "seed", 1, "seeds clip choice, jitter and drops")
+	// M9. Additive and off by default: every flag above keeps exactly the
+	// meaning docs/BENCH.md froze, and a run without this flag behaves
+	// identically to before. With it, loadgen starts IDLE and serves a
+	// small control API instead of running one batch and exiting — which
+	// is what lets the dashboard's "Start load" button exist without the
+	// gateway growing its own duplicate of the streaming client.
+	flag.StringVar(&cfg.controlAddr, "control-addr", envOr("LOADGEN_CONTROL_ADDR", ""),
+		"serve the load-control API on this address and start idle (e.g. :8090)")
 	flag.Parse()
+
+	if cfg.controlAddr != "" {
+		if err := serveControl(cfg); err != nil {
+			log.Fatalf("loadgen: %v", err)
+		}
+		return
+	}
 
 	if err := run(cfg); err != nil {
 		// Reaching here means loadgen could not run at all — bad flags, an
@@ -163,7 +179,22 @@ func main() {
 	}
 }
 
+// run is the CLI entry point: one batch, ended by --duration or Ctrl-C.
 func run(cfg config) error {
+	// Ctrl-C ends the run cleanly — streams close their sessions and the
+	// CSV is flushed — rather than leaving a truncated file and a fleet
+	// full of half-open sessions.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runCtx(ctx, cfg)
+}
+
+// runCtx is the same batch under a caller-supplied context, so the M9
+// control API can stop a run on demand. Cancelling it is the same code
+// path as Ctrl-C: streams close their sessions and the summary still
+// prints, rather than the process being torn down mid-stream and leaving
+// the fleet holding handles nobody will ever Close.
+func runCtx(ctx context.Context, cfg config) error {
 	if cfg.streams < 1 {
 		return fmt.Errorf("--streams must be at least 1, got %d", cfg.streams)
 	}
@@ -185,12 +216,6 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
-
-	// Ctrl-C ends the run cleanly — streams close their sessions and the
-	// CSV is flushed — rather than leaving a truncated file and a fleet
-	// full of half-open sessions.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	var cnt counters
 	events := make(chan event, eventChanBuffer)

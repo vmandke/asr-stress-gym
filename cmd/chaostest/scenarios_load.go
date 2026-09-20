@@ -36,9 +36,9 @@ func scenario4RateLimitStorm(wsURL, gatewayURL, clipPath string, fleet map[strin
 	}
 	defer resetAllFaults(fleet)
 
-	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-a"], fleet["worker-b"])
+	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-zip-1"], fleet["worker-zip-2"])
 	if err != nil {
-		return fmt.Errorf("could not pin a session to worker-a or worker-b: %w", err)
+		return fmt.Errorf("could not pin a session to worker-zip-1 or worker-zip-2: %w", err)
 	}
 	defer s.close()
 
@@ -123,7 +123,7 @@ func scenario6GrayFailure(wsURL, gatewayURL, clipPath string, fleet map[string]w
 	// Give the cluster a p95 to compare against first. With no healthy
 	// traffic anywhere, every worker looks equally slow and there is no
 	// "gray" to detect — the comparison is relative by design.
-	warm, _, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-a"], fleet["worker-b"], fleet["worker-c"])
+	warm, _, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-zip-1"], fleet["worker-zip-2"], fleet["worker-ctc-1"])
 	if err != nil {
 		return fmt.Errorf("warm-up session: %w", err)
 	}
@@ -134,9 +134,9 @@ func scenario6GrayFailure(wsURL, gatewayURL, clipPath string, fleet map[string]w
 	_, _ = warm.end(ctx, warmSeq)
 	warm.close()
 
-	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-a"], fleet["worker-b"])
+	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-zip-1"], fleet["worker-zip-2"])
 	if err != nil {
-		return fmt.Errorf("could not pin a session to worker-a or worker-b: %w", err)
+		return fmt.Errorf("could not pin a session to worker-zip-1 or worker-zip-2: %w", err)
 	}
 	defer s.close()
 
@@ -177,9 +177,9 @@ func scenario7Blackhole(wsURL, gatewayURL, clipPath string, fleet map[string]wor
 	}
 	defer resetAllFaults(fleet)
 
-	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-a"], fleet["worker-b"])
+	s, pinned, err := openSessionPinnedToOneOf(ctx, wsURL, 10, fleet["worker-zip-1"], fleet["worker-zip-2"])
 	if err != nil {
-		return fmt.Errorf("could not pin a session to worker-a or worker-b: %w", err)
+		return fmt.Errorf("could not pin a session to worker-zip-1 or worker-zip-2: %w", err)
 	}
 	defer s.close()
 
