@@ -299,7 +299,9 @@ func TestHandleBackendFailureSucceedsOnFirstAttempt(t *testing.T) {
 	}
 }
 
-func TestHandleBackendFailureUnbindsDeadWorkerFirst(t *testing.T) {
+// A successful failover TRANSFERS the binding: the replacement takes it
+// and the dead worker gives it up, so the fleet-wide total is unchanged.
+func TestHandleBackendFailureTransfersTheBinding(t *testing.T) {
 	deps, _ := setup(t, "K1", 4, 10, nil)
 	dead := router.NewWorker("worker-old", newFakeBackend(), "K1", mockCaps())
 	dead.BindSession() // the session was pinned here before it died
@@ -310,7 +312,117 @@ func TestHandleBackendFailureUnbindsDeadWorkerFirst(t *testing.T) {
 		t.Fatalf("HandleBackendFailure: %v", err)
 	}
 	if dead.Outstanding() != 0 {
-		t.Fatalf("dead worker's Outstanding = %d, want 0 (unbound on failure)", dead.Outstanding())
+		t.Errorf("dead worker's Outstanding = %d, want 0 (handed the session over)", dead.Outstanding())
+	}
+	if good.Outstanding() != 1 {
+		t.Errorf("replacement's Outstanding = %d, want 1 (took the session on)", good.Outstanding())
+	}
+}
+
+// The bug this pair exists for. HandleBackendFailure used to unbind the
+// dead worker UP FRONT, before knowing whether recovery would succeed.
+// Every failure return then restores State.WorkerID to that same worker,
+// and the caller's terminal cleanup unbinds it again — so a session that
+// fails to recover decrements its worker TWICE and leaves `outstanding`
+// permanently negative.
+//
+// It is not a cosmetic counter. Pick scores on least-outstanding, so a
+// worker sitting at -9 looks maximally attractive forever and skews
+// routing for the rest of the process's life. Observed live as
+// `worker-a outstanding=-3, worker-c outstanding=-9` after a 12-stream
+// run, which is exactly one extra decrement per terminally-failed session.
+//
+// The contract these assert: on ANY failure return, the session is still
+// bound to its original owner, so the caller's single terminal unbind is
+// correct.
+func TestFailedFailoverLeavesTheSessionBoundToItsOriginalOwner(t *testing.T) {
+	deps, _ := setup(t, "K1", 4, 10, nil)
+	owner := router.NewWorker("worker-old", newFakeBackend(), "K1", mockCaps())
+	owner.BindSession()
+
+	badFB := newFakeBackend()
+	badFB.openErr = errors.New("this one is broken too")
+	bad := router.NewWorker("worker-bad", badFB, "K2", mockCaps())
+	deps.Router = router.New([]*router.Worker{owner, bad})
+
+	if _, _, _, err := HandleBackendFailure(context.Background(), deps, errors.New("dead")); err == nil {
+		t.Fatal("expected failover to exhaust")
+	}
+	if got := owner.Outstanding(); got != 1 {
+		t.Errorf("owner's Outstanding = %d, want 1 — the caller still owes exactly one unbind", got)
+	}
+	if got := bad.Outstanding(); got != 0 {
+		t.Errorf("failed candidate's Outstanding = %d, want 0 — it never took the session", got)
+	}
+}
+
+func TestFailoverWithNoReplacementLeavesTheSessionBound(t *testing.T) {
+	deps, _ := setup(t, "K1", 4, 10, nil)
+	owner := router.NewWorker("worker-old", newFakeBackend(), "K1", mockCaps())
+	owner.BindSession()
+	deps.Router = router.New([]*router.Worker{owner}) // nowhere else to go
+
+	before := metrics.FailoverExhaustedTotal.Load()
+	if _, _, _, err := HandleBackendFailure(context.Background(), deps, errors.New("dead")); err == nil {
+		t.Fatal("expected an error when no replacement exists")
+	}
+	if got := owner.Outstanding(); got != 1 {
+		t.Errorf("owner's Outstanding = %d, want 1", got)
+	}
+	// This return path bypassed the counter entirely, so an empty fleet
+	// produced terminal failures that `failover_exhausted_total` never
+	// reported — 8 of 12 on the run that surfaced it.
+	if got := metrics.FailoverExhaustedTotal.Load() - before; got != 1 {
+		t.Errorf("failover_exhausted_total delta = %d, want 1", got)
+	}
+}
+
+// The end-to-end ledger: whatever happens, a session contributes exactly
+// one bind that exactly one unbind cancels. Simulates the caller's
+// terminal cleanup, which is the half that made the live counts negative.
+func TestBindingLedgerBalancesAcrossSuccessAndFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		replacable bool
+	}{
+		{"recovery succeeds", true},
+		{"recovery fails", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, _ := setup(t, "K1", 4, 10, nil)
+			owner := router.NewWorker("worker-old", newFakeBackend(), "K1", mockCaps())
+			owner.BindSession() // session.start
+
+			other := newFakeBackend()
+			if !tc.replacable {
+				other.openErr = errors.New("broken")
+			}
+			key := session.CacheCompatibilityKey("K1")
+			if !tc.replacable {
+				key = "K2" // force the Open path that openErr fails
+			}
+			repl := router.NewWorker("worker-b", other, key, mockCaps())
+			workers := []*router.Worker{owner, repl}
+			deps.Router = router.New(workers)
+
+			_, _, _, _ = HandleBackendFailure(context.Background(), deps, errors.New("dead"))
+
+			// The caller's terminal cleanup: unbind whoever State names now.
+			if w, ok := deps.Router.Find(deps.State.WorkerID); ok {
+				w.UnbindSession()
+			}
+
+			var total int64
+			for _, w := range workers {
+				if got := w.Outstanding(); got < 0 {
+					t.Errorf("%s has negative Outstanding %d", w.ID, got)
+				}
+				total += w.Outstanding()
+			}
+			if total != 0 {
+				t.Errorf("fleet-wide Outstanding = %d, want 0 — one bind, one unbind", total)
+			}
+		})
 	}
 }
 

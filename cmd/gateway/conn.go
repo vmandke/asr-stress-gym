@@ -28,6 +28,7 @@ import (
 	"asr-stress-gym/internal/backend"
 	"asr-stress-gym/internal/bifrost"
 	"asr-stress-gym/internal/coord"
+	"asr-stress-gym/internal/dash"
 	"asr-stress-gym/internal/journal"
 	"asr-stress-gym/internal/metrics"
 	"asr-stress-gym/internal/router"
@@ -66,6 +67,15 @@ const (
 	writeTimeout      = 2 * time.Second
 	closeTimeout      = 2 * time.Second
 	checkpointTimeout = 2 * time.Second
+
+	// A stateless push can cost two extra hops the pinned path never pays
+	// — a tier fetch when the chunk lands on a worker that did not serve
+	// the last one, and a tier publish on the way out — on top of Bifrost's
+	// own retry budget across the pool. Wider than the direct backend
+	// client for that reason, and still bounded: a push that has not
+	// answered by now has missed its partial anyway, and failing lets
+	// coord replay rather than stalling the session.
+	statelessPushTimeout = 10 * time.Second
 )
 
 // connConfig is what every connection shares: one Router and one
@@ -74,11 +84,22 @@ const (
 // library inside the gateway process, not a service, and every
 // connection's sessionLoop calls Pick/Report on the SAME instance.
 type connConfig struct {
-	Router           *router.Router
-	Checkpoints      *coord.CheckpointStore
-	Admission        *admission.Controller
-	Bifrost          *bifrost.Client // nil unless BIFROST_URL — nil-safe throughout
-	BifrostFinals    bool            // route ONLINE finals through Bifrost too; off by default, see finalText
+	Router        *router.Router
+	Checkpoints   *coord.CheckpointStore
+	Admission     *admission.Controller
+	Bifrost       *bifrost.Client // nil unless BIFROST_URL — nil-safe throughout
+	Hub           *dash.Hub       // dashboard observation point; nil-safe, tests leave it nil
+	BifrostFinals bool            // route ONLINE finals through Bifrost too; off by default, see finalText
+	// The model half of Bifrost's "provider/model" string. The PROVIDER
+	// half is chosen per request from the router's pool (bifrostPool);
+	// this is just the name every worker answers to, since each advertises
+	// models: ["*"].
+	BifrostModelAlias string
+	// StatelessStream routes ONLINE streaming through Bifrost by moving KV
+	// state to a shared per-family tier, instead of pinning the session to
+	// one worker. Off by default: it is a different set of trade-offs, not
+	// a strict improvement — see docs/STATELESS-KVTIER.md.
+	StatelessStream  bool
 	NewAudioPipeline func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error)
 }
 
@@ -126,7 +147,7 @@ func handleConnection(parentCtx context.Context, ws *websocket.Conn, cfg connCon
 	done := make(chan struct{})
 
 	go readLoop(ctx, ws, frames)
-	go writeLoop(ctx, cancel, ws, events, done)
+	go writeLoop(ctx, cancel, ws, events, done, cfg.Hub)
 
 	// sessionLoop deliberately does NOT cancel ctx itself (see its own
 	// comment): only close(events). If it also canceled ctx here, that
@@ -179,7 +200,13 @@ func readLoop(ctx context.Context, ws *websocket.Conn, frames chan<- inboundMsg)
 	}
 }
 
-func writeLoop(ctx context.Context, cancel context.CancelFunc, ws *websocket.Conn, events <-chan any, done chan<- struct{}) {
+// The Hub tap is here, and only here. Everything the client is told, the
+// dashboard sees — one observation point rather than a call beside each of
+// the ten Emitter sites, which is the version that stays correct when
+// someone adds an event type. It runs on the write goroutine, so
+// Observe's contract (never blocks, never errors) is load-bearing; see
+// internal/dash's package comment.
+func writeLoop(ctx context.Context, cancel context.CancelFunc, ws *websocket.Conn, events <-chan any, done chan<- struct{}, hub *dash.Hub) {
 	defer cancel()
 	defer close(done)
 
@@ -189,6 +216,7 @@ func writeLoop(ctx context.Context, cancel context.CancelFunc, ws *websocket.Con
 	// exiting, rather than racing a cancellation against undelivered
 	// events still sitting in the channel buffer.
 	for ev := range events {
+		hub.Observe(ev)
 		data, err := json.Marshal(ev)
 		if err != nil {
 			log.Printf("gateway: marshal event %T: %v", ev, err)
@@ -262,6 +290,7 @@ func sessionLoop(ctx context.Context, cfg connConfig, frames <-chan inboundMsg, 
 			cfg.Admission.Release()
 		}
 		if started {
+			cfg.Hub.SessionEnded(sessID, "closed")
 			cctx, ccancel := context.WithTimeout(context.Background(), closeTimeout)
 			if err := client.Close(cctx, state.Handle); err != nil {
 				log.Printf("gateway[%s]: backend close: %v", sessID, err)
@@ -340,6 +369,7 @@ func handleControl(
 		// happens later, and under a ramp that is precisely the work the
 		// gateway cannot afford — the point of refusing is to not spend.
 		if d := cfg.Admission.Admit(); d.Refused {
+			cfg.Hub.Refused(state.SessionID, d.Reason)
 			trySend(ctx, events, emitter.Overloaded(d.Reason, d.RetryAfter))
 			return false // retryable, and NOT an error event: the session was never created
 		}
@@ -381,6 +411,7 @@ func handleControl(
 			// terminal.
 			if errors.Is(err, router.ErrNoCapacity) {
 				metrics.AdmissionRejectedTotal.Add(1)
+				cfg.Hub.Refused(state.SessionID, "no capable worker available")
 				trySend(ctx, events, emitter.Overloaded("no capable worker available", admissionRetryAfter))
 				return false
 			}
@@ -397,6 +428,34 @@ func handleControl(
 		*client = target.Client
 		*started = true
 
+		// Swap in the shared-tier client, if this session qualifies. The
+		// router has already done the part that genuinely needs runtime
+		// knowledge — capability filtering, rate budget, health, and the
+		// choice of FAMILY — and that is kept. What changes is only that
+		// the session is no longer bound to the individual worker the
+		// router landed on: state now lives in the family's tier, so any
+		// member can serve any chunk and Bifrost owns placement within
+		// the pool. See docs/PRODUCTION-SHAPE.md for why the split lands
+		// here and not elsewhere.
+		if sc, handle, ok := statelessClientFor(ctx, cfg, target, state.SessionID, mode); ok {
+			// The handle opened a moment ago is deliberately abandoned:
+			// it would hold worker-side state this path never reads.
+			// Closing it costs one round trip per session and keeps the
+			// worker's handle table honest, which its /health reports.
+			if err := target.Client.Close(ctx, resp.Handle); err != nil {
+				log.Printf("gateway[%s]: could not close the unused pinned handle: %v", state.SessionID, err)
+			}
+			*client = sc
+			state.Handle = handle
+			log.Printf("gateway[%s]: stateless streaming via bifrost pool, tier=%s",
+				state.SessionID, target.KVTierURL)
+		}
+
+		// After the Open, never before: a stream row exists only once
+		// there is a worker to attribute it to, so the dashboard never
+		// shows a session pinned to nothing.
+		cfg.Hub.SessionStarted(state.SessionID, string(mode), target.ID, string(target.CompatibilityKey))
+
 		// Piggyback session_id delivery on the existing ack contract
 		// (docs/PROTOCOL.md) rather than inventing a session.started
 		// event: an ack for the session.start frame's own seq is both
@@ -410,7 +469,7 @@ func handleControl(
 			return false
 		}
 		for _, c := range deps.Pipeline.Flush() { // dispatch whatever tail never crossed a chunk threshold
-			if !dispatchChunk(ctx, c, *deps, client, events) {
+			if !dispatchChunk(ctx, c, *deps, client, events, cfg.Hub) {
 				return false
 			}
 		}
@@ -484,6 +543,11 @@ func handleAudioFrame(ctx context.Context, cfg connConfig, f wire.Frame, deps co
 	// internal/journal's package doc for why this, plus Recut, is the
 	// complete replay mechanism with no separate dispatch-log structure.
 	deps.Journal.Append(audio.Record{Seq: f.Seq, DurationMs: ref.DurationMs, Voiced: ref.Voiced, Payload: f.Payload})
+	// The data-flow ledger. Recorded right here, between the two things
+	// that make the three tiers distinct: the frame has just been
+	// journaled unconditionally (recovery tier), and whether it reaches a
+	// worker at all depends on ref.Voiced.
+	cfg.Hub.FrameIngested(deps.State.SessionID, ref.DurationMs, ref.Voiced)
 
 	var endpoint bool
 	for {
@@ -502,7 +566,7 @@ func handleAudioFrame(ctx context.Context, cfg connConfig, f wire.Frame, deps co
 	}
 
 	for _, c := range deps.Pipeline.Ready() {
-		if !dispatchChunk(ctx, c, deps, client, events) {
+		if !dispatchChunk(ctx, c, deps, client, events, cfg.Hub) {
 			return false
 		}
 	}
@@ -542,6 +606,98 @@ func handleAudioFrame(ctx context.Context, cfg connConfig, f wire.Frame, deps co
 // **Bifrost is never allowed to lose a final.** Any failure — unreachable,
 // timeout, non-200, malformed body — falls through to the direct path,
 // which is the same call the gateway would have made anyway.
+// bifrostPool turns the gateway's OWN routing decision into a Bifrost
+// primary plus a homogeneous fallback chain.
+//
+// It replaces a static BIFROST_MODEL env var, and the difference is not
+// cosmetic. With a fixed model name, an offline session was routed twice
+// and the two answers disagreed: the router pinned a worker, opened a
+// handle and pushed chunks into it, and then the final went to whatever
+// the env var named — observed live as three different workers involved in
+// one session, with the pushed state discarded.
+//
+// Now the primary IS the worker the router chose, and the fallbacks are
+// exactly that worker's cache-compatible peers (router.Pool), which is
+// derived from the compatibility keys the workers advertised rather than
+// from configuration. Two properties follow, both by construction rather
+// than by convention:
+//
+//   - the chain cannot cross a model family, because membership is key
+//     equality — the same test that decides whether a KV cache can be
+//     imported at all;
+//   - it cannot drift from the fleet, because there is no second place
+//     where the grouping is written down.
+//
+// Bifrost is then doing the job it is genuinely good at — retry, failover
+// and health across a set of interchangeable endpoints — while every
+// decision needing runtime knowledge stays in the router. That is the
+// two-layer shape production uses; see docs/PRODUCTION-SHAPE.md.
+//
+// Falls back to the configured static model when the router has no view of
+// the worker (it was removed from the fleet, or this is a test with no
+// router), so this can never leave the chain empty.
+func bifrostPool(cfg connConfig, workerID string) (primary string, fallbacks []string) {
+	if cfg.Router == nil {
+		return "", nil // Client uses its configured default
+	}
+	pool := cfg.Router.Pool(workerID)
+	if len(pool) == 0 {
+		return "", nil
+	}
+	name := func(w *router.Worker) string { return w.ID + "/" + cfg.BifrostModelAlias }
+	primary = name(pool[0])
+	for _, w := range pool[1:] {
+		fallbacks = append(fallbacks, name(w))
+	}
+	return primary, fallbacks
+}
+
+// statelessClientFor decides whether this session can run on the shared-tier
+// path, and builds the client if so.
+//
+// Every condition is a real requirement, not a guard rail:
+//
+//   - STATELESS_STREAM, because this is a different trade, not a strict
+//     improvement: it buys freedom from affinity and pays for it in state
+//     transfer whenever a chunk lands somewhere new.
+//   - Bifrost, because it is what routes within the pool. Without it the
+//     gateway would be picking a worker per chunk itself, which is the
+//     thing being delegated.
+//   - ONLINE only. An offline session emits no partials and already has a
+//     better path: one stateless transcription of the whole utterance
+//     (finalText). Streaming its chunks through a tier would move state
+//     for no reason.
+//   - A tier the family actually advertises, and an adapter that can
+//     serialize. Both come from /health, so a fleet that cannot do this
+//     silently keeps the pinned path rather than failing sessions.
+func statelessClientFor(ctx context.Context, cfg connConfig, target *router.Worker, sessionID string, mode session.Mode) (backend.Client, string, bool) {
+	if !cfg.StatelessStream || !cfg.Bifrost.Enabled() || mode != session.ModeOnline {
+		return nil, "", false
+	}
+	if target.KVTierURL == "" || !target.Capabilities.Serializable {
+		return nil, "", false
+	}
+	primary, fallbacks := bifrostPool(cfg, target.ID)
+	if primary == "" {
+		return nil, "", false
+	}
+
+	sc := backend.NewStatelessClient(
+		cfg.Bifrost.BaseURL(), target.KVTierURL, primary, fallbacks,
+		backend.WorkerAdvert{
+			WorkerID:             target.ID,
+			CompatibilityKeyHash: string(target.CompatibilityKey),
+			Capabilities:         target.Capabilities,
+		},
+		statelessPushTimeout,
+	)
+	resp, err := sc.Open(ctx, backend.OpenReq{SessionID: sessionID, Mode: string(mode)})
+	if err != nil {
+		return nil, "", false
+	}
+	return sc, resp.Handle, true
+}
+
 func finalText(ctx context.Context, cfg connConfig, deps coord.RecoveryDeps, client *backend.Client, startSeq uint64) (string, error) {
 	useBifrost := cfg.Bifrost.Enabled() &&
 		(deps.State.Mode == session.ModeOffline || cfg.BifrostFinals)
@@ -553,8 +709,11 @@ func finalText(ctx context.Context, cfg connConfig, deps coord.RecoveryDeps, cli
 		records := deps.Journal.ReadAfter(startSeq)
 		if len(records) > 0 {
 			wav := audio.WAVFromRecords(records, uint32(deps.State.SampleRateHz))
-			text, err := cfg.Bifrost.Transcribe(ctx, wav)
+			primary, peers := bifrostPool(cfg, deps.State.WorkerID)
+			text, err := cfg.Bifrost.TranscribeVia(ctx, wav, primary, peers)
 			if err == nil {
+				log.Printf("gateway[%s]: bifrost pool primary=%s fallbacks=%v served_by=%s",
+					deps.State.SessionID, primary, peers, cfg.Bifrost.LastProvider())
 				return text, nil
 			}
 			log.Printf("gateway[%s]: bifrost final failed, falling back to direct flush: %v",
@@ -571,7 +730,7 @@ func finalText(ctx context.Context, cfg connConfig, deps coord.RecoveryDeps, cli
 // make a new utterance inherit the old model state and transcript.
 func finalizeEndpoint(ctx context.Context, cfg connConfig, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
 	for _, c := range deps.Pipeline.Flush() {
-		if !dispatchChunk(ctx, c, deps, client, events) {
+		if !dispatchChunk(ctx, c, deps, client, events, cfg.Hub) {
 			return false
 		}
 	}
@@ -638,7 +797,7 @@ func finalizeEndpoint(ctx context.Context, cfg connConfig, deps coord.RecoveryDe
 // this Push was ever attempted (handleAudioFrame appends before
 // dispatching), so the recovery's own replay — which reads the journal
 // from the checkpoint or last committed boundary — already covers it.
-func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, client *backend.Client, events chan<- any) bool {
+func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, client *backend.Client, events chan<- any, hub *dash.Hub) bool {
 	pushStarted := time.Now()
 	resp, err := (*client).Push(ctx, backend.PushReq{
 		Handle:             deps.State.Handle,
@@ -670,12 +829,24 @@ func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, 
 			deps.Router.On429(deps.State.WorkerID, rl.RetryAfter)
 		}
 
+		// Snapshotted BEFORE the recovery, which mutates both in place.
+		// The dashboard renders "worker-a=3f9a worker-c=b721 MISMATCH",
+		// and that line is only truthful if the left-hand side is who the
+		// session was actually pinned to a moment ago.
+		fromWorker := deps.State.WorkerID
+		fromKey := string(deps.State.CompatibilityKey)
+
 		newClient, resetEv, regenerated, ferr := coord.HandleBackendFailure(ctx, deps, err)
 		if ferr != nil {
 			trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("failover exhausted: %v", ferr)))
 			return false
 		}
 		*client = newClient
+		// sameKey is read back from the state coord itself updated, not
+		// recomputed from a second comparison — see dash.Hub.Failover.
+		hub.Failover(deps.State.SessionID, fromWorker, deps.State.WorkerID,
+			fromKey, string(deps.State.CompatibilityKey),
+			fromKey == string(deps.State.CompatibilityKey))
 		if !trySend(ctx, events, resetEv) {
 			return false
 		}
@@ -690,7 +861,14 @@ func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, 
 	// unit tests: no live worker ever accumulates a p95 to compare against
 	// the fleet. Failure reporting remains in HandleBackendFailure so the
 	// triggering error is counted exactly once before a replacement is Picked.
-	deps.Router.Report(deps.State.WorkerID, true, time.Since(pushStarted))
+	pushTook := time.Since(pushStarted)
+	deps.Router.Report(deps.State.WorkerID, true, pushTook)
+	// The same sample, to the dashboard. Deliberately the same measurement
+	// the router acts on rather than a second clock around a slightly
+	// different span: a latency chart that disagrees with the ejection
+	// policy it is meant to explain is worse than no chart.
+	hub.PushObserved(deps.State.SessionID, deps.State.WorkerID, pushTook)
+	hub.ChunkDispatched(deps.State.SessionID, len(c.Bytes), false)
 
 	deps.State.Generation = resp.Generation
 	deps.State.LastAppliedSeq = resp.LastSeqApplied
@@ -711,14 +889,48 @@ func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, 
 	// check the common case becomes one extra HTTP round trip per chunk
 	// whose only possible answer is 501. The error path below handles
 	// ErrNotSupported quietly and correctly; this just stops asking.
+	serializable := false
 	if w, ok := deps.Router.Find(deps.State.WorkerID); ok && w.Capabilities.Serializable {
+		serializable = true
 		go asyncCheckpoint(deps.Checkpoints, *client, deps.State.SessionID, deps.State.CompatibilityKey, deps.State.Handle)
 	}
+	reportState(deps, hub, serializable)
 
 	if !trySend(ctx, events, deps.Emitter.Partial(resp.Text)) {
 		return false
 	}
 	return trySend(ctx, events, deps.Emitter.Ack(resp.LastSeqApplied))
+}
+
+// reportState tells the dashboard where this session's state currently
+// lives, across all three tiers — the worker-side handle, the gateway's
+// warm checkpoint, and the gateway's audio journal.
+//
+// It reads the checkpoint store rather than being told by the checkpoint
+// writer, because the writer is asynchronous and best-effort (invariant
+// 13): what matters to a reviewer is what is actually THERE to recover
+// from right now, not what was most recently attempted.
+func reportState(deps coord.RecoveryDeps, hub *dash.Hub, serializable bool) {
+	var (
+		cpSeq   uint64
+		cpBytes int
+		why     string
+	)
+	cp, ok := deps.Checkpoints.Latest(deps.State.SessionID)
+	switch {
+	case ok:
+		cpSeq, cpBytes = cp.Seq, len(cp.StateBlob)
+	case !serializable:
+		// Permanent and expected: sherpa-onnx and CTranslate2 expose no
+		// way to serialize inference state, so four of this fleet's six
+		// workers can never have a warm tier. Recovery here is always a
+		// full audio replay, and saying so is the point.
+		why = "adapter cannot serialize — recovery is audio replay"
+	default:
+		why = "none taken yet"
+	}
+	hub.StateObserved(deps.State.SessionID, deps.State.Handle, deps.State.Generation,
+		deps.Journal.Len(), deps.Journal.SpanMs(), cpSeq, cpBytes, why, serializable)
 }
 
 func asyncCheckpoint(checkpoints *coord.CheckpointStore, client backend.Client, sessionID string, key session.CacheCompatibilityKey, handle string) {

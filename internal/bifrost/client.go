@@ -35,6 +35,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +47,28 @@ type Client struct {
 	model     string
 	fallbacks []string
 	hc        *http.Client
+
+	// The provider that served the most recent successful request.
+	// Diagnostic only: read by the gateway's log line and by the routing
+	// trace, never by any decision.
+	lastProvider atomic.Value
+}
+
+// LastProvider reports which provider served the last successful call, or
+// "" if none has. Nil-safe like the rest of this type.
+func (c *Client) LastProvider() string {
+	if c == nil {
+		return ""
+	}
+	v, _ := c.lastProvider.Load().(string)
+	return v
+}
+
+func pick(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // New returns nil when baseURL is empty — i.e. when BIFROST_URL is unset.
@@ -84,14 +107,56 @@ func New(baseURL, model string, fallbacks []string, timeout time.Duration) *Clie
 
 func (c *Client) Enabled() bool { return c != nil }
 
+// BaseURL is for callers that must build their own request against the
+// same Bifrost instance rather than go through Transcribe — currently only
+// backend.StatelessClient, whose requests carry KV state references this
+// package has no business knowing about.
+func (c *Client) BaseURL() string {
+	if c == nil {
+		return ""
+	}
+	return c.baseURL
+}
+
 // Transcribe posts one complete utterance as an OpenAI-shaped multipart
 // request and returns the text.
 //
 // `wav` is opaque here — it was built by internal/audio, the only package
 // allowed to know what a sample is.
 func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
+	return c.TranscribeVia(ctx, wav, c.model, c.fallbacks)
+}
+
+// TranscribeVia routes one utterance through a CALLER-SUPPLIED pool: a
+// primary provider and an ordered fallback chain.
+//
+// This is what makes Bifrost load-bearing rather than decorative here.
+// With a fixed `model` from an env var, Bifrost answered a question the
+// gateway had already answered better — and answered it differently, so
+// an offline session pinned to one worker had its final computed on
+// another, discarding the state it had just built. Worse, the static
+// fallback chain crossed model families, which is harmless for stateless
+// audio and would be silent corruption for anything carrying state.
+//
+// Supplying the pool per request fixes both. The caller passes the worker
+// its own router chose, followed by that worker's cache-compatible peers
+// (router.Pool), so:
+//
+//   - the primary is the gateway's decision, not a config constant;
+//   - the chain is homogeneous BY CONSTRUCTION and cannot cross a family;
+//   - Bifrost does the part it is actually good at — retry, failover and
+//     health across a set of interchangeable endpoints — while every
+//     decision needing runtime knowledge stays in the router.
+//
+// That is the two-layer shape production uses (docs/PRODUCTION-SHAPE.md):
+// a gateway that resolves names and fails over, in front of a pool whose
+// members are interchangeable by construction.
+func (c *Client) TranscribeVia(ctx context.Context, wav []byte, model string, fallbacks []string) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("bifrost: not enabled")
+	}
+	if model == "" {
+		model = c.model
 	}
 
 	var body bytes.Buffer
@@ -103,12 +168,12 @@ func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
 	if _, err := part.Write(wav); err != nil {
 		return "", err
 	}
-	if err := mw.WriteField("model", c.model); err != nil {
+	if err := mw.WriteField("model", model); err != nil {
 		return "", err
 	}
 	// Repeated form fields, one per fallback, in order. Bifrost gives each
 	// provider its own full retry budget before moving to the next.
-	for _, f := range c.fallbacks {
+	for _, f := range fallbacks {
 		if err := mw.WriteField("fallbacks", f); err != nil {
 			return "", err
 		}
@@ -135,6 +200,7 @@ func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
 
 	var out struct {
 		Text        string `json:"text"`
+		WorkerID    string `json:"worker_id"` // the worker's own answer — see worker/server.py
 		ExtraFields struct {
 			Provider string `json:"provider"`
 		} `json:"extra_fields"`
@@ -142,6 +208,12 @@ func (c *Client) Transcribe(ctx context.Context, wav []byte) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("bifrost: decode: %w", err)
 	}
+	// Which provider actually served is recorded, not acted on. The
+	// gateway must not start second-guessing Bifrost's choice within a
+	// pool — that is the one decision genuinely delegated to it — but
+	// "which of the pool answered" is exactly what a trace needs to show
+	// that a fallback happened, so it is observable.
+	c.lastProvider.Store(pick(out.ExtraFields.Provider, out.WorkerID))
 	return out.Text, nil
 }
 

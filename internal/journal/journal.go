@@ -127,3 +127,16 @@ func (j *Journal) Len() int { return j.size }
 
 // Cap reports the fixed capacity this Journal was constructed with.
 func (j *Journal) Cap() int { return len(j.records) }
+
+// SpanMs is how much audio time the retained records cover. Reported for
+// the dashboard's recovery-tier view, where the useful question is not
+// "how many records" but "how many seconds of audio could this session
+// rebuild from" — which is the actual bound on what a cross-model
+// failover can replay.
+func (j *Journal) SpanMs() int64 {
+	var total float64
+	for _, r := range j.entries() {
+		total += r.DurationMs
+	}
+	return int64(total)
+}

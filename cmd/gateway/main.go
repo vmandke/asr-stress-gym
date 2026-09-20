@@ -8,11 +8,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -22,6 +25,7 @@ import (
 	"asr-stress-gym/internal/backend"
 	"asr-stress-gym/internal/bifrost"
 	"asr-stress-gym/internal/coord"
+	"asr-stress-gym/internal/dash"
 	"asr-stress-gym/internal/metrics"
 	"asr-stress-gym/internal/router"
 	"asr-stress-gym/internal/session"
@@ -79,6 +83,26 @@ func envInt(key string, fallback int) int {
 	return n
 }
 
+// envEnabled accepts the conventional empty/0/false/off spellings. It is
+// intentionally only used for benchmark isolation: a cold-replay run must
+// be able to turn off checkpoint creation without maintaining a second
+// gateway binary. Normal deployments keep the default true.
+func envEnabled(key string, fallback bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "0", "false", "off", "no":
+		return false
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		log.Printf("gateway: ignoring %s=%q (want boolean); using %t", key, v, fallback)
+		return fallback
+	}
+}
+
 // parseWorkerURLs reads "id=url,id=url,..." — e.g.
 // "worker-a=http://worker-a:9000,worker-b=http://worker-b:9000".
 func parseWorkerURLs(spec string) map[string]string {
@@ -133,11 +157,25 @@ func buildRouter(urls map[string]string) *router.Router {
 			continue
 		}
 		w := router.NewWorker(id, client, session.CacheCompatibilityKey(advert.CompatibilityKeyHash), advert.Capabilities)
+		w.Model = advert.Model
+		if advert.KVTier != nil && advert.KVTier.Enabled {
+			w.KVTierURL = advert.KVTier.URL
+		}
 		workers = append(workers, w)
-		log.Printf("gateway: worker %s ready — model=%s key=%s streaming=%v serializable=%v",
-			id, advert.Model, advert.CompatibilityKeyHash, advert.Capabilities.Streaming, advert.Capabilities.Serializable)
+		log.Printf("gateway: worker %s ready — model=%s key=%s streaming=%v serializable=%v kv_tier=%s",
+			id, advert.Model, advert.CompatibilityKeyHash, advert.Capabilities.Streaming,
+			advert.Capabilities.Serializable, orNone(w.KVTierURL))
 	}
 	return router.New(workers)
+}
+
+// orNone keeps the startup log honest about an absent tier rather than
+// printing an empty field that reads as a truncated line.
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
@@ -158,37 +196,111 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 //
 // Read-only, and derived from the router rather than mirrored, so it
 // cannot drift from what selection really sees.
-func workersHandler(rt *router.Router, adm *admission.Controller) http.HandlerFunc {
-	type workerView struct {
-		ID           string `json:"id"`
-		Status       string `json:"status"`
-		Outstanding  int64  `json:"outstanding"`
-		RateLimited  bool   `json:"rate_limited"`
-		CompatKey    string `json:"compatibility_key_hash"`
-		Streaming    bool   `json:"streaming"`
-		Serializable bool   `json:"serializable"`
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		out := struct {
-			Workers           []workerView `json:"workers"`
-			AdmittedSessions  int64        `json:"admitted_sessions"`
-			HighWaterSessions int64        `json:"high_water_sessions"`
-		}{AdmittedSessions: adm.Admitted(), HighWaterSessions: adm.HighWater()}
-
+// The view itself moved to internal/dash at M9 so the dashboard snapshot
+// and this endpoint are literally the same struct. Two near-identical
+// definitions is how they would drift, and cmd/chaostest parses this one.
+func fleetView(rt *router.Router, adm *admission.Controller) dash.FleetFunc {
+	return func() dash.FleetView {
+		out := dash.FleetView{
+			AdmittedSessions:  adm.Admitted(),
+			HighWaterSessions: adm.HighWater(),
+			ClusterP95Ms:      float64(rt.ClusterP95().Microseconds()) / 1000,
+			EjectAtMultip:     router.GrayFailureMultiple,
+		}
 		for _, wk := range rt.Workers() {
-			out.Workers = append(out.Workers, workerView{
+			errRate, p95, samples := wk.Stats()
+			out.Workers = append(out.Workers, dash.WorkerView{
+				ErrorRate:    errRate,
+				LatencyP95Ms: float64(p95.Microseconds()) / 1000,
+				LatencySamps: samples,
 				ID:           wk.ID,
 				Status:       wk.Status().String(),
 				Outstanding:  wk.Outstanding(),
 				RateLimited:  wk.Bucket.Blocked(),
 				CompatKey:    string(wk.CompatibilityKey),
+				Model:        wk.Model,
+				Modes:        wk.Capabilities.Modes,
 				Streaming:    wk.Capabilities.Streaming,
 				Serializable: wk.Capabilities.Serializable,
+				Draining:     wk.Draining(),
 			})
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(out)
+		return out
 	}
+}
+
+func workersHandler(fleet dash.FleetFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(fleet())
+	}
+}
+
+// nodeProbe reads every worker's /health once per sampling tick, for the
+// dashboard's per-node resource graphs.
+//
+// It asks the WORKER, not the router: the router's view is about
+// selection (is this worker a candidate) and is derived from the gateway's
+// own call outcomes, while this is about the worker's own resource
+// reality. They can legitimately disagree — a healthy worker at 95% of its
+// memory limit, or an ejected worker that is perfectly idle — and seeing
+// both is the point. A failed probe is recorded as an explicit not-ok
+// sample so a dead node draws as a gap, not as zeros.
+func nodeProbe(rt *router.Router) dash.NodeProbe {
+	return func(ctx context.Context) []dash.NodeSample {
+		workers := rt.Workers()
+		out := make([]dash.NodeSample, len(workers))
+		var wg sync.WaitGroup
+		for i, wk := range workers {
+			wg.Add(1)
+			go func(i int, wk *router.Worker) {
+				defer wg.Done()
+				s := dash.NodeSample{Node: wk.ID, AtMs: time.Now().UnixMilli()}
+				adv, err := wk.Client.Health(ctx)
+				if err != nil {
+					s.Detail = err.Error()
+					out[i] = s
+					return
+				}
+				s.OK = true
+				s.ActiveSessions = adv.ActiveSessions
+				s.QueueDepth = adv.QueueDepth
+				s.Inflight = adv.Inflight
+				s.Running = adv.Running
+				s.RTFP50 = adv.RTFP50
+				s.CPUPercent = adv.CPUPercent
+				s.RSSBytes = adv.RSSBytes
+				s.MemBytes = adv.CgroupMemoryBytes
+				s.MemLimit = adv.CgroupMemoryLimitBytes
+				s.UptimeS = adv.UptimeS
+				if s.MemBytes == nil {
+					s.MemBytes = adv.RSSBytes // no cgroup: RSS is the honest stand-in
+				}
+				out[i] = s
+			}(i, wk)
+		}
+		wg.Wait()
+		return out
+	}
+}
+
+// chaosTargets maps each worker to its two fault-injection surfaces. The
+// supervisor's admin port is derived from the worker URL by replacing the
+// port, because compose fixes that relationship (9000/9001 in every worker
+// service) and a second env var listing the same six hosts again is a
+// second thing to keep in sync. WORKER_ADMIN_URLS overrides it for any
+// deployment where that does not hold.
+func chaosTargets(urls map[string]string, override string) map[string]dash.Target {
+	admin := parseWorkerURLs(override)
+	out := map[string]dash.Target{}
+	for id, u := range urls {
+		a, ok := admin[id]
+		if !ok {
+			a = strings.Replace(u, ":9000", ":9001", 1)
+		}
+		out[id] = dash.Target{WorkerURL: u, AdminURL: a}
+	}
+	return out
 }
 
 // corruptCheckpointHandler is chaos scenario 5's gateway-side fault
@@ -199,7 +311,7 @@ func workersHandler(rt *router.Router, adm *admission.Controller) http.HandlerFu
 func corruptCheckpointHandler(checkpoints *coord.CheckpointStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID := r.PathValue("session_id")
-		ok := checkpoints.Corrupt(sessionID)
+		ok := checkpoints != nil && checkpoints.Corrupt(sessionID)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"corrupted": ok, "session_id": sessionID})
 	}
@@ -208,16 +320,23 @@ func corruptCheckpointHandler(checkpoints *coord.CheckpointStore) http.HandlerFu
 func main() {
 	dashboardAddr := envOr("DASHBOARD_ADDR", ":7000")
 	wsAddr := envOr("WS_ADDR", ":7070")
-	// Defaults to the single mock worker so a bare `go run ./cmd/gateway`
-	// still works without the full compose fleet up; the fleet (M3+)
-	// sets this explicitly to every worker service.
-	workerURLs := envOr("WORKER_URLS", "worker-mock=http://worker-mock:9000")
+	// Defaults to one real worker so a bare `go run ./cmd/gateway` still
+	// resolves something; the fleet sets this explicitly to every worker
+	// service. The mock worker was removed from the deployed fleet at M11
+	// — the `mock` ADAPTER remains, for unit tests that must pass on a
+	// clone with no model weights.
+	workerURLs := envOr("WORKER_URLS", "worker-a=http://worker-a:9000")
 
 	rt := buildRouter(parseWorkerURLs(workerURLs))
 	if len(rt.Workers()) == 0 {
 		log.Printf("gateway: WARNING — no workers answered at startup; every session will fail until one becomes reachable")
 	}
-	checkpoints := coord.NewCheckpointStore()
+	var checkpoints *coord.CheckpointStore
+	if envEnabled("CHECKPOINTS_ENABLED", true) {
+		checkpoints = coord.NewCheckpointStore()
+	} else {
+		log.Printf("gateway: checkpoints disabled (benchmark cold-replay mode)")
+	}
 	adm := admission.New(admission.Config{
 		MaxSessions:  int64(envInt("MAX_SESSIONS", 200)),
 		SoftSessions: int64(envInt("SOFT_SESSIONS", 150)),
@@ -240,26 +359,91 @@ func main() {
 		if envOr("BIFROST_FINALS", "") != "" {
 			scope = "offline sessions AND online finals"
 		}
-		log.Printf("gateway: Bifrost enabled at %s — routing %s via %s; partials always direct",
-			envOr("BIFROST_URL", ""), scope, bf.Describe())
+		// The pool is chosen PER SESSION from the router's own view
+		// (conn.go bifrostPool), so there is no single chain to print
+		// here any more — printing one would describe behaviour the
+		// gateway no longer has.
+		log.Printf("gateway: Bifrost enabled at %s — routing %s; the provider pool is derived per session "+
+			"from the router's compatibility-key cohort, so a fallback chain can never cross a model family. "+
+			"Partials always direct.", envOr("BIFROST_URL", ""), scope)
 	}
 
+	// Bifrost's own metrics endpoint lives beside its API. Scraped for the
+	// dashboard only; nothing here influences routing.
+	bifrostStats := dash.NewBifrostScraper(envOr("BIFROST_URL", ""))
+	go bifrostStats.Run(context.Background())
+
+	hub := dash.NewHub()
+	nodes := dash.NewNodeSampler(nodeProbe(rt))
+	go nodes.Run(context.Background())
+
 	cfg := connConfig{
-		Router:        rt,
-		Checkpoints:   checkpoints,
-		Admission:     adm,
-		Bifrost:       bf,
-		BifrostFinals: envOr("BIFROST_FINALS", "") != "",
+		Router:            rt,
+		Checkpoints:       checkpoints,
+		Admission:         adm,
+		Bifrost:           bf,
+		Hub:               hub,
+		BifrostFinals:     envOr("BIFROST_FINALS", "") != "",
+		BifrostModelAlias: envOr("BIFROST_MODEL_ALIAS", "whisper-1"),
+		StatelessStream:   envOr("STATELESS_STREAM", "") != "",
 		NewAudioPipeline: func(sampleRateHz uint32, chunkMs float64) (audio.Pipeline, error) {
 			return audio.NewVADPipeline(sampleRateHz, chunkMs, audio.DefaultVADConfig)
+		},
+	}
+
+	fleet := fleetView(rt, adm)
+	control := &dash.Control{
+		Hub:          hub,
+		Fleet:        fleet,
+		Nodes:        nodes,
+		Targets:      chaosTargets(parseWorkerURLs(workerURLs), envOr("WORKER_ADMIN_URLS", "")),
+		LoadgenURL:   envOr("LOADGEN_URL", ""),
+		BifrostStats: bifrostStats,
+		// Cohorts, derived live from the router rather than configured:
+		// workers are grouped by the compatibility key they advertise, and
+		// each cohort's tier is whatever its members advertise at /health.
+		// The dashboard therefore cannot show a family->tier mapping the
+		// fleet does not actually have.
+		KVPools: func() []dash.KVPool {
+			byKey := map[string]*dash.KVPool{}
+			for _, w := range rt.Workers() {
+				key := string(w.CompatibilityKey)
+				p, ok := byKey[key]
+				if !ok {
+					p = &dash.KVPool{CompatKey: key}
+					byKey[key] = p
+				}
+				p.Workers = append(p.Workers, w.ID)
+				if p.TierURL == "" {
+					p.TierURL = w.KVTierURL
+				}
+			}
+			out := make([]dash.KVPool, 0, len(byKey))
+			for _, p := range byKey {
+				out = append(out, *p)
+			}
+			sort.Slice(out, func(i, j int) bool { return out[i].Workers[0] < out[j].Workers[0] })
+			return out
+		},
+		// Graceful drain is a routing decision, so it is implemented here
+		// rather than by asking the worker to start refusing — see
+		// dash.Control.Drain and router.Worker.SetDraining.
+		Drain: func(id string, on bool) error {
+			w, ok := rt.Find(id)
+			if !ok {
+				return fmt.Errorf("unknown worker %q", id)
+			}
+			w.SetDraining(on)
+			return nil
 		},
 	}
 
 	dashMux := http.NewServeMux()
 	dashMux.HandleFunc("GET /health", healthHandler)
 	dashMux.HandleFunc("GET /api/debug/metrics", metricsHandler)
-	dashMux.HandleFunc("GET /api/debug/workers", workersHandler(rt, adm))
+	dashMux.HandleFunc("GET /api/debug/workers", workersHandler(fleet))
 	dashMux.HandleFunc("POST /api/debug/corrupt-checkpoint/{session_id}", corruptCheckpointHandler(checkpoints))
+	control.Mount(dashMux)
 
 	wsMux := http.NewServeMux()
 	wsMux.HandleFunc("/ws", wsHandler(cfg))

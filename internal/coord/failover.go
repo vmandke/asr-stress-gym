@@ -171,17 +171,36 @@ func RecoverCrossModel(ctx context.Context, deps RecoveryDeps, target *router.Wo
 // client variable. Returns an error only once every attempt is
 // exhausted, which the caller should treat as session-terminal.
 func HandleBackendFailure(ctx context.Context, deps RecoveryDeps, cause error) (backend.Client, session.PartialResetEvent, *string, error) {
-	excluded := map[string]bool{deps.State.WorkerID: true}
-	deps.Router.Report(deps.State.WorkerID, false, 0)
-	if dead, ok := deps.Router.Find(deps.State.WorkerID); ok {
-		dead.UnbindSession()
-	}
+	// The session's owner on entry. The binding ledger is keyed on this:
+	// whoever State.WorkerID names holds exactly one bind, and the dead
+	// worker is unbound ONLY once a replacement has actually taken the
+	// session over (below).
+	//
+	// Unbinding here, up front, is the obvious-looking version and it is
+	// wrong. Every failure return from this function restores
+	// State.WorkerID to this same owner, and the caller's terminal
+	// cleanup then unbinds it a second time — so a session that fails to
+	// recover decrements its worker twice and leaves `outstanding`
+	// permanently negative. That is not a cosmetic counter: Pick scores
+	// on least-outstanding, so a worker at -9 looks maximally attractive
+	// forever and skews routing for the life of the process.
+	owner := deps.State.WorkerID
+	excluded := map[string]bool{owner: true}
+	deps.Router.Report(owner, false, 0)
 
 	lastErr := cause
 	for attempt := 1; attempt <= MaxFailoverAttempts; attempt++ {
 		previous := *deps.State
 		target, err := deps.Router.Pick(deps.State.Mode, excluded, deps.State.CompatibilityKey)
 		if err != nil {
+			// Counted here too. This is an exhausted failover — the
+			// session is about to die for want of a worker — and it
+			// previously returned without touching the counter, so
+			// `failover_exhausted_total` under-reported every failure
+			// caused by an empty fleet rather than by a failed recovery.
+			// On a 12-stream run with the fleet ejected, 8 of 12 terminal
+			// failures went uncounted.
+			metrics.FailoverExhaustedTotal.Add(1)
 			return nil, session.PartialResetEvent{}, nil, fmt.Errorf("coord: no replacement worker available: %w", err)
 		}
 
@@ -208,7 +227,15 @@ func HandleBackendFailure(ctx context.Context, deps RecoveryDeps, cause error) (
 			} else {
 				metrics.FailoverCrossModelTotal.Add(1)
 			}
+			// Transfer, as one step: the replacement takes the bind and
+			// the dead worker gives it up, only now that recovery has
+			// actually succeeded. From here State.WorkerID names the
+			// target, so the caller's single terminal unbind lands on the
+			// right worker and the ledger balances.
 			target.BindSession()
+			if dead, ok := deps.Router.Find(owner); ok {
+				dead.UnbindSession()
+			}
 			deps.Router.Report(target.ID, true, 0)
 			return client, resetEv, text, nil
 		}

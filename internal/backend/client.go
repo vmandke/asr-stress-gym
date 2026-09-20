@@ -136,6 +136,14 @@ type RestoreResp struct {
 	LastSeqApplied uint64 `json:"last_seq_applied"`
 }
 
+// KVTierAdvert is the worker's half of the shared-KV-tier contract: where
+// it reads and publishes session state. See cmd/kvtier and
+// docs/STATELESS-KVTIER.md.
+type KVTierAdvert struct {
+	Enabled bool   `json:"enabled"`
+	URL     string `json:"url"`
+}
+
 // WorkerAdvert matches build-plan.md's "Worker advertisement" JSON,
 // already served at M0's GET /health — plus Capabilities (M3), an
 // additive extension: the router (internal/router) must filter and score
@@ -152,6 +160,35 @@ type WorkerAdvert struct {
 	QueueDepth           int          `json:"queue_depth"`
 	RTFP50               *float64     `json:"rtf_p50"`
 	LastHeartbeatMs      int64        `json:"last_heartbeat_ms"`
+
+	// M9 resource telemetry, for the dashboard's per-node graphs
+	// (internal/dash). Pointers because "not measured on this platform"
+	// and "measured as zero" are different facts and the dashboard draws
+	// them differently — a gap in the line versus a line at the floor.
+	// resources.py returns None off Linux, where /proc does not exist.
+	//
+	// Nothing in the ROUTER reads these. Selection policy stays a
+	// function of health, latency, rate budget and capability
+	// (internal/router); adding memory pressure to it is a real design
+	// question with its own failure modes (a worker near its limit being
+	// starved of the traffic that would let it finish and free state),
+	// not a free upgrade because the number happens to be available now.
+	// Which shared KV tier this worker publishes its state to, advertised
+	// rather than configured gateway-side for the same reason the
+	// compatibility key is: there must be no second copy of the
+	// family->tier mapping that could drift from the fleet's own. Each
+	// model family has its own tier (docker-compose.yml, x-kvtier).
+	// Absent or disabled means this worker serves only the pinned path.
+	KVTier *KVTierAdvert `json:"kv_tier"`
+
+	Inflight               int      `json:"inflight"`
+	Running                int      `json:"running"`
+	InflightHighWater      int      `json:"inflight_high_water"`
+	UptimeS                float64  `json:"uptime_s"`
+	RSSBytes               *int64   `json:"rss_bytes"`
+	CgroupMemoryBytes      *int64   `json:"cgroup_memory_bytes"`
+	CgroupMemoryLimitBytes *int64   `json:"cgroup_memory_limit_bytes"`
+	CPUPercent             *float64 `json:"cpu_percent"`
 }
 
 // CheckpointResp is the worker's answer to "give me your current state to
