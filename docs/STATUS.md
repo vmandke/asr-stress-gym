@@ -263,12 +263,176 @@ Reported, not rounded up.
 - [ ] Benchmarks A (cache vs no-cache), B (cold replay vs checkpoint — mock only), C (same- vs cross-model — full matrix), D (offline interference), E (rate limiting), F (capacity)
 - [ ] Four charts: latency-over-time w/ kill marker, latency-vs-concurrency, inference-ms-vs-utterance-length, recovery-time-by-mode
 
+## M11 — a real KV cache (Phase 0 spikes: **all gates passed**)
+
+Plan: [docs/KVCACHE-ALTERNATIVES.md](KVCACHE-ALTERNATIVES.md). Background:
+[KVCACHE-DEEPDIVE.md](KVCACHE-DEEPDIVE.md).
+
+The enabling discovery: **sherpa-onnx hides the streaming state behind
+`OnlineStream`, but the ONNX graph underneath does not.** The encoder
+takes 35 state tensors in and returns 35 out, including `cached_key`,
+`cached_val` and `cached_val2` — literal attention keys and values, with
+`left_context_len = 64,32,16,8,32` frames per stack. Driving the graph
+directly makes that cache ours: sizeable, serializable, transferable.
+
+All measured against `models/download/zipformer-en-20M/`, the weights
+`worker-a`/`worker-b` already serve.
+
+| Spike | Question | Result |
+|---|---|---|
+| **S1** | Can we drive encoder+decoder+joiner ourselves? | **PASS** — `'QUICK BROWN FOX JUMPS OVER THE LAZY DOG NEAR THE RIVER'` |
+| **S2** | Snapshot mid-utterance, restore, continue → identical text? | **PASS — 22/22 identical** across 8 clips × 3 kill points |
+| **S3** | Restore into a **separate process** → identical? | **PASS** — 1.09 MB blob written by process A, restored by process B, same transcript |
+| **S4** | RTF vs sherpa-onnx | **PASS** — ours 0.0139, sherpa 0.0188: **0.74×, i.e. faster** |
+| **S5** | `kaldi-native-fbank` usable? | **PASS** — with two API gotchas, below |
+
+KV state: **35 tensors, 1.09 MB per session** at fp32 (545 KB fp16,
+273 KB int8).
+
+### Findings from the spikes
+
+| What | How it surfaced | Resolution |
+|---|---|---|
+| **The KV tensors are not the whole state — the feature seam matters** | S2 first ran **2/10 identical**, and every failure was at the resume point: `FOX`→`OX`, `JUMPS`→`JUMP`, `TEST`→`DUST` | On snapshot, up to `T-1 = 38` feature frames (~380 ms) sit in a buffer the encoder has not consumed. Dropping them loses that audio. Carrying the seam across took S2 to **22/22**. In production the gateway already replays exactly this audio from the journal (`last_seq_applied`), so the adapter must either serialize the buffer or rely on that replay — a real design decision, not an accident |
+| `OnlineFbank.get_frame` indexes **absolutely**, not from a cursor | `IndexError: deque` on the second chunk | `pop()` shifts the frame indices; the caller must keep its own read position instead. Wrapped in a `Feats` class |
+| Encoder state outputs are `new_<name>`, not `<name>_next` | `InvalidArgument: Invalid input name: new_cached_val_3` | The in/out pairing is derived from the graph and **asserted**, never hardcoded — a different export that breaks the convention now fails loudly instead of mis-wiring silently |
+| Our transcripts drop the final word (`RECOR`, missing `BANK`) | Comparing against sherpa's output | The same tail-padding issue M5 already documented: a streaming encoder has not seen the last ~0.6 s without right context. `TAIL_PADDING_S = 0.6` applies to our loop too |
+
+**Consequence:** the repository can, for the first time, checkpoint and
+restore a **real model's attention state**. The warm tier stops being
+mock-only.
+
+### Phases 1–3 — built and verified end to end
+
+- [x] `worker/kvcache/` — `state.py` (the tensor bank + layout, derived
+      from the graph and asserted), `serde.py` (safetensors, validated
+      header), `quant.py` (fp32/fp16/int8)
+- [x] `worker/adapters/zipformer_kv.py` — **`serializable: True`**, the
+      first real adapter for which that is true
+- [x] `state_bytes` wired through `/health` — measured **2.19 MB for two
+      live sessions**, replacing the hardcoded 0
+- [x] `worker-f` / `worker-g` behind the `kv` compose profile, sharing a
+      compatibility key with each other and with neither `worker-a/b`
+- [x] 15 KV tests + 7 conformance tests green; worker suite 59 → **81
+      passing**, no new failures
+
+**The headline, measured against the running stack.** All workers but the
+KV pair drained, 4 streams, `worker-f` SIGKILLed mid-utterance:
+
+```
+failover_total          = 2
+failover_same_model     = 2
+checkpoint_RESTORES     = 2      <- was permanently 0 on real models
+checkpoint_degraded     = 0
+duplicate_finals        = 0
+errors=0  discontinuities=0
+```
+
+Cross-container transfer verified directly at the HTTP layer too: a
+1.10 MB safetensors blob checkpointed from `worker-f` and restored into
+`worker-g`, a different container.
+
+### Further findings from building it
+
+| What | How it surfaced | Resolution |
+|---|---|---|
+| **The KV tensors are not a complete checkpoint either — the decode hypothesis must travel with them** | `test_restore_continues_identically` failed with the restored text missing its *opening* words: `'OVER THE LAZY DOG NEAR THE RIVER BANK'` against `'QUICK BROWN FOX JUMPS OVER THE LAZY DOG NEAR THE RIVER BANK'` | The tensors restore *acoustic* context; the accumulated transducer hypothesis is the *transcript* state. It is tempting to omit because the decoder is stateless given the last `context_size` tokens — but then a restore silently truncates the utterance to whatever was decoded after the failover. `StateBank` now carries all three parts, and each one has a test that fails distinctively without it |
+| setuptools flat-layout discovery broke the image build | `error: Multiple top-level packages discovered in a flat-layout: ['kvcache', 'adapters']` | Auto-discovery worked only while `adapters` was the sole top-level package. `[tool.setuptools] packages` is now explicit |
+| onnxruntime emits a `recursive_mutex lock failed` abort at interpreter exit | Seen after the suite passes | Teardown noise from ORT session finalization, not a test failure — `pytest` exits 0 for the KV and conformance suites. Noted rather than chased |
+
+**Still open (Phases 4–6):** the int8 path is implemented and unit-tested
+but not yet benchmarked for text drift; chaos scenarios 12/13 are not
+written; the Bifrost-versus-router evaluation is planned but not yet
+written up.
+
 ## M9 — dashboard and HA profile (hard 1-day timebox)
 
-- [ ] Static `/dashboard`, `/api/events` SSE, canvas charts, client-side filtering
-- [ ] Control plane over existing chaos endpoints; compat-key-hash visible per node
-- [ ] `docker-compose.ha.yml`: nginx L4 `least_conn`, two gateways, client-side replay ring
-- [ ] **Fallback if timeboxed out:** ship the static charts from M8, skip the UI
+See [docs/DASHBOARD.md](DASHBOARD.md) for the design, the endpoint list, and why SSE.
+
+- [x] Static `/dashboard/`, `/api/events` SSE with `Last-Event-ID` resume, canvas charts, client-side filtering
+- [x] Control plane over the existing chaos endpoints (`POST /api/chaos/{worker}/{action}`); compat-key hash visible per node, and rendered as MATCH/MISMATCH on every failover log line
+- [x] `POST /api/load/{n}` — the stack comes up quiet and the reviewer applies load from the page (`cmd/loadgen --control-addr`, additive; the CLI contract in BENCH.md is unchanged)
+- [x] Per-node resource graphs: memory against each container's **cgroup limit**, real queue depth, CPU, sessions, RTF — plus the gateway on the same axes
+- [x] Stacked per-worker traffic chart, so a kill is visible as throughput moving rather than as a log line
+- [x] `docker-compose.ha.yml`: nginx **L4** `least_conn`, two gateways. Verified by `docker kill`ing gateway-1 mid-stream: **new** sessions through nginx kept succeeding (3/3 finals, 0 errors), while the 3 in-flight sessions pinned to the dead gateway ended with `errors=3`. That is the documented limit, now measured rather than asserted — the gateway holds the journal and checkpoints in memory, so HA covers *new* sessions, not in-flight ones
+- [x] `make demo` — the headless twin of click-Kill, with assertions
+- [ ] Client-side replay ring under HA: `cmd/loadgen -reconnect-every` exists and resumes from the last ack, but no scenario asserts a session surviving a **gateway** death
+
+**Verified against the running stack**, 20 streams, `worker-mock` SIGKILLed at
+steady state:
+
+| | before | +4s | +10s |
+|---|---|---|---|
+| worker-mock pushes | 1545 | 1574 | **1574** (dead, frozen) |
+| worker-a pushes | 1077 | 1422 | **1947** |
+| worker-b pushes | 167 | 255 | **401** |
+
+`failover_total 10`, `failover_cross_model_total 10`,
+`duplicate_finals_total 0`. Push p50/p99 2.2ms/27.4ms at 20 streams.
+
+Measured node memory against limits: worker-c 310M/1536M (20%, the 130MB
+CTC model), worker-a/b 161–211M, worker-mock 73M/512M, gateway 31M/1024M.
+
+### Bugs and findings from building M9
+
+| What | How it surfaced | Resolution |
+|---|---|---|
+| `make demo` killed a hardcoded `worker-a` | The kill produced `failover_total 0` — a PASS that proved nothing | The router scores on latency as well as outstanding count, so the fastest worker takes most sessions (12 streams → ~9/1/2, two streaming workers picked not at all). `worker-a` held 1 of 12. The victim is now chosen at runtime as the busiest worker — the same trap as M7's `findPinnedWorker`, in a different costume |
+| `pkill -f "cmd/loadgen"` left a load generator running | A distribution reading showed 20 outstanding sessions for 10 requested streams | `go run` execs the build output as a child whose argv does not contain `./cmd/loadgen`, so the pattern kills only the wrapper. The stray generator silently doubled the load and made the reading a fiction. `demo.sh` now builds the binary explicitly and holds its PID |
+| `resources.py` not in the worker image | Every worker crashed on boot: `ModuleNotFoundError: No module named 'resources'` | `worker/Dockerfile` copies named files, not the directory. Caught immediately because the container exits; worth noting as the cost of the explicit COPY list |
+| `/health` reported `queue_depth: 0` always | Writing the queue graph and finding it was a flat line by construction | Now real: `inflight` (accepted) minus `running` (in the executor) is the backlog. A replayed push is counted before the guard, so a failover storm does not read as backlog on an idle worker. `state_bytes` stays an honest 0 |
+| `worker-e` reported no memory at all | `mem=None` for one node while five others had numbers | It was running an image built before `resources.py` (it is behind the `models` profile and was not rebuilt). Not a bug — and it accidentally confirmed the nullable design: the node drew a **gap**, not a line at zero |
+| **`Worker.Outstanding` went negative** (`worker-a -3`, `worker-c -9`) | The dashboard's topology pane renders the session count per node, so a negative was impossible to miss — it had been invisible in the JSON for three milestones | `HandleBackendFailure` unbound the dead worker **up front**, before knowing whether recovery would succeed. Every failure return restores `State.WorkerID` to that same worker, and the caller's terminal cleanup unbinds it again — one extra decrement per terminally-failed session. Not cosmetic: `Pick` scores on `(Outstanding+1) * latencyP95`, so a worker at -9 looks maximally attractive **forever** and skews routing for the life of the process. Now a transfer — bind the replacement and unbind the dead worker together, only once recovery has actually succeeded |
+| `failover_exhausted_total` under-reported | Chasing the count above: -12 across the fleet, but only 4 exhaustions reported | The `no replacement worker available` early return bypassed the counter entirely, so every terminal failure caused by an *empty fleet* went uncounted — 8 of 12 on the run that surfaced it |
+| A restored worker never takes traffic again | Killing a node, restoring it, and watching it sit at 0 | Working as designed, but badly surfaced: sessions are pinned for life, and loadgen holds each stream open for the whole `--duration`, so **no new `session.start` ever fires** and nothing re-`Pick`s. A restored worker rejoins only when new sessions open. Ejection recovery has the same shape — `Ejected → probe` needs a `Pick` to carry the probe |
+| Port 7000 unavailable on macOS | `bind: address already in use` — `ControlCe` (AirPlay Receiver) | Already documented in the compose file; `GATEWAY_DASHBOARD_PORT=7001` is the workaround, now repeated in DASHBOARD.md |
+
+## M12 — stateless streaming through Bifrost (shared KV tier)
+
+The question this answers: can Bifrost route STREAMING traffic, not just
+offline finals? It could not while a session's KV cache lived inside one
+worker process — the session was pinned and a load balancer could only
+honour the pin. Moving the state out makes affinity an optimization rather
+than a correctness requirement. Design and numbers:
+[KVCACHE.md](KVCACHE.md).
+
+- [x] `cmd/kvtier` — per-family shared tier: opaque blobs, immutable versions, TTL + LRU byte ceiling, exact and prefix delete. 10 tests
+- [x] `worker/kvtier.py` — tier client plus the local hot cache that keeps this from being slower than pinning; `local` / `tier` / `miss` reported per request and cumulatively at `/health`
+- [x] `kv_mode=stream|final` with `state_ref`/`state_sink` on the worker's OpenAI-shaped endpoint — the only shape Bifrost routes
+- [x] `backend.StatelessClient` — implements the ordinary `backend.Client`, so the session loop, failover, journal and metrics are untouched. 11 tests
+- [x] One tier **per model family**, learned by the gateway from `/health`, never configured — same rule as the compatibility key, so the mapping has one home
+- [x] `STATELESS_STREAM=1` behind a flag; default stack unchanged
+- [x] `scripts/prove_stateless_bifrost.py` — one session's chunks fanned across different workers via Bifrost, transcript byte-identical to a single-worker reference
+- [x] `scripts/stateless_ab.sh` / `make stateless-ab` — the same load run both ways
+
+**Measured, not asserted.** Bifrost forwards unknown *request* fields
+verbatim but **strips unknown response fields** (verified with a purpose-built
+echo provider), so state can travel in but not back. The design never needs
+it to: the caller names the output reference up front, and a cache miss is
+signalled as an HTTP **424** because status codes survive the hop.
+
+Safety, against the running stack: reference resolves nowhere → **424**
+with the worker's error body intact through Bifrost; zipformer blob read by
+a CTC worker → **422**, refused *before* deserialization; read by its twin
+→ **200**, 1,105,800 bytes moved.
+
+### Bugs this milestone found
+
+| Symptom | How it surfaced | Cause and fix |
+|---|---|---|
+| **Tier evicting 87% of everything written** (5,682 of 6,528 versions), costing 12 sessions their state | Only under stress — 30 streams for 60s. Invisible at 5 streams | Immutable versions accumulated with nothing reclaiming them until session close, and the 5-minute TTL never fires inside a 60s run. One version per chunk at 160ms is ~375 per session. `StatelessClient.Push` now retires version N once N+1 is durable — safe there because the push has returned. Evictions **5,682 → 0**, peak resident **268 MB → 46 MB** |
+| Exact-key `DELETE` could take unrelated versions | Found while writing the retirement fix, not by a failure | It was implemented as a prefix delete, so retiring `s1:10` would also take `s1:100` and `s1:101` — silent state loss for any session reaching three-digit versions, surfacing as a 424 far from its cause. Split into `Delete` (exact) and `DeletePrefix` |
+| A cross-family blob appeared to be accepted (HTTP 200) | Ad-hoc probe during the safety checks | **Not a bug** — my own fleet hygiene. The CTC worker was still on a pre-change image, so `kv_mode` was an unknown field and it silently ran the old one-shot path. Caught by the response shape lacking `kv_hit`. Rebuilt; the real answer is 422. Recorded because it is the second time this session a stale container nearly produced a false finding |
+| **12 tier misses per 30-stream run**, invisible in the gateway log | Only at stress, and only because the miss counter disagreed with the error count | `finalizeEndpoint` ends a VAD utterance with `Close` then `Open`. `Close` deletes every version in the tier, but `StatelessClient.Open` returned the same handle **without resetting the version counter**, so the next utterance's first push referenced a version that had just been deleted. Invisible in any single-utterance test. The arithmetic confirmed it: 12 misses = 6 failovers x 2 chain members, and `dispatchChunk` hands the error to `HandleBackendFailure` without logging it, so the session silently finished on the pinned path. `Open` now resets. Misses **12 -> 0**, failovers **6 -> 0** |
+| **An ejected worker could never be probed back** — "latency stuck at max" on the dashboard | Noticed as a chart frozen at a high value; turned out to be four of six workers ejected with `failover_exhausted_total=27` | `Pick` scored every eligible candidate on `(Outstanding+1) * latencyP95` and called `beginProbe()` only on the WINNER. But an ejected worker's p95 is frozen at whatever ejected it — no traffic reaches it, so no new sample can arrive — while a healthy peer's is live and small: ejected/0 sessions `(0+1)*0.664 = 0.664` vs healthy/5 sessions `(5+1)*0.019 = 0.114`. The peer would need ~34 concurrent sessions to lose. A circuit breaker whose half-open state was unreachable. Proved live by restoring a dead worker: it answered `/health` in 5s and stayed ejected at a frozen 664ms for 40s+ under traffic. Fixed by holding a probe-due worker out of the scoring pass entirely and preferring it — `probing` already bounded it to one trial at a time. Verified live: three permanently-ejected workers recovered within 12s. The existing probe test could not catch this because its fleet had ONE worker, so the ejected one won by default |
+| **"Immutable" versions were mutable in the worker's hot cache** | Not by a test or a failure — by review | Adapters mutate state IN PLACE and return the same object (`_consume` writes `bank.pending`, `frames_consumed`, absorbs tensors). The hot cache handed out a live reference and then `store` filed the *same object* under the successor, so the predecessor's entry silently became the state AFTER the chunk. A retry landing back on this worker would apply the chunk twice; the same retry routed to a peer would fetch the correct serialized bytes and be right — **correctness as a function of placement**, the exact property the design exists to remove. Fixed by consuming the entry on load (`_hot_take`) rather than deep-copying 1.09 MB per chunk, plus create-only (`PutIfAbsent`, 409) so two retries cannot both write one version. Regression tests verified to fail with the bug reintroduced |
+
+### Open
+
+- **A probe still needs a new session to carry it.** The scoring trap is fixed, but `Pick` only runs at `session.start`, so an ejected worker recovers only when fresh sessions arrive. With long-lived streams and no churn it waits — observed: one worker stayed ejected while eight 4-minute sessions ran, because none of them ended. A router-side background prober (its own timer, not riding client traffic) is the real fix and is not built
+- A session recovered by `coord` onto a new worker reverts to the pinned path — `statelessClientFor` runs only at session start
+- Zero-copy (`/dev/shm` + mmap'd safetensors) designed but not built
+- **Latency comparison is not established.** p50 favours stateless consistently (partials 40ms vs 20ms) but those are round numbers plausibly quantized to the 20ms frame cadence. The pinned path's p95 varied 30x across four runs (280 / 3,780 / 5,020 / 8,020 ms) — and a control run with `CHECKPOINTS_ENABLED=false` was the *worst* of them, refuting the obvious explanation that `asyncCheckpoint` was the cost. Needs a quiet machine and repeated runs before any latency claim is made
 
 ## M10 — writeup
 

@@ -513,9 +513,13 @@ straight back to the worker that just refused.
 
 ## 10. The Bifrost boundary
 
-For the full distinction between Bifrost response routing and a worker's live
-inference/KV cache, including the safe design if stateful Bifrost routing is
-ever made a hard requirement, see [BIFROST-KVCACHE.md](BIFROST-KVCACHE.md).
+This section describes the **pinned** default. For the distinction between
+Bifrost response routing and a worker's live inference cache, why Mooncake
+is not integrated, and what a fully recompute-stateless online path would
+cost, see [KVCACHE-ALTERNATIVES.md](KVCACHE-ALTERNATIVES.md). For the
+opt-in path where Bifrost *does* route streaming chunks within a model
+family — because the request carries a reference to shared state rather
+than the state itself — see [KVCACHE.md](KVCACHE.md).
 
 ```
 partials during speech  ──▶ DIRECT to the pinned worker   stateful, latency-critical

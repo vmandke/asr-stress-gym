@@ -7,118 +7,137 @@ cache, routing, replay, failover and observability.
 > **Model cache accelerates recovery when compatible. Audio replay
 > guarantees recovery when it is not.**
 
-## Status
+## Try it
 
-**M5 — the real model fleet.** The gateway streams audio over the wire
-protocol, journals it, pins each session to a capability-compatible
-worker, and recovers from worker failure through either compatible
-restore + tail replay or fresh-state audio replay. The workers now run
-**real ASR models** rather than the mock: a streaming transducer, a
-streaming CTC model of a different family, and the same Whisper weights
-under two different runtimes. `make chaos` verifies failover scenarios 2,
-3 and 5 against that fleet.
+```bash
+make live             # fleet + per-family KV tiers + Bifrost + stateless
+                      # streaming + load, then prints the mic URL
+make live STREAMS=0   # same, without background load
+```
+
+Then open the printed `…/dashboard/mic.html` and **talk into it while the
+load runs**. It is a real client on the same wire protocol as the load
+generator, and it shows, live: which worker answered and whether the
+session is pinned or on the shared KV tier, the cache's actual tensors and
+sizes, how your audio is chunked, how much the VAD gated as silence, and
+your own state versions being published and retired. Kill the worker
+serving you from the dashboard and keep talking — the transcript survives.
+
+Microphone capture needs a secure context. `localhost` counts as one, a LAN
+IP does not, so open the URL exactly as printed.
+
+`make live` rebuilds by default. A stale worker image ignores the `kv_mode`
+field and quietly serves on the old path instead of erroring, which is
+exactly how a demo lies to you; pass `NO_BUILD=1` when you know the images
+are current.
+
+## What it does
+
+The gateway streams audio over the wire protocol, journals it, and either
+pins each session to a capability-compatible worker or — with
+`STATELESS_STREAM=1` — lets Bifrost route every chunk within the session's
+model family, because the request carries a *reference* to state held in a
+shared tier rather than the state itself. Either way it recovers from
+worker failure through compatible restore plus tail replay, or fresh-state
+audio replay when the compatibility key differs.
+
+Every deployed adapter owns a **real KV cache**: it drives the model's ONNX
+graphs directly rather than through a wrapper that hides the state.
+
+```
+worker-zip-1/2        zipformer_kv       transducer        35 tensors   1.09 MB
+worker-ctc-1/2        conformer_ctc_kv   CTC                3 tensors   2.72 MB
+worker-whisper-1/2    whisper_kv         encoder-decoder    2 tensors   5.51 MB
+```
+
+Four properties of that fleet are load-bearing:
+
+- **Each pair shares one compatibility key**, so a failover inside a pair
+  is the cheap path — a 1.09 MB safetensors blob moves and the session
+  continues.
+- **The three families cannot read each other's state.** Transducer state
+  is structurally meaningless to CTC, so a cross-family failover must build
+  fresh state and replay the journal. That degradation is the finding, not
+  a gap.
+- **Whisper cannot stream.** Its encoder consumes a fixed 30 s window, so
+  it is a healthy backend the router must *refuse* for an online session
+  rather than mis-serve.
+- **State sizes differ 5×.** That is why each family gets its own KV tier
+  rather than sharing one byte ceiling — a whisper burst would otherwise
+  evict zipformer sessions out of a shared LRU.
+
+## Entry points
 
 ```bash
 ./scripts/check_env.sh   # verify go/python/docker/compose are present
-make up                  # docker compose up --build
-make down                # docker compose down -v
-make chaos               # real-stack failover scenarios 2, 3, and 5
-make models              # fetch model weights for running adapters on the host
-make rtf                 # regenerate docs/RTF.md from the adapters
+make live                # the full stateless demo, above
+make start               # the default pinned stack
+make stateless-ab        # pinned vs stateless, measured side by side
+make stateless-proof     # prove chunks really fan out across a pool
+make chaos               # real-stack failover scenarios
+make dashboard           # bring the stack up and open the operator view
+make mic                 # open the microphone client
+make bench               # the frozen loadgen benchmark set
+make kv-quant            # fp32 / fp16 / int8 blob size vs text drift
+make test                # Go + Python suites
+make models              # fetch model weights
+make up / make down      # compose up --build / down -v
 ```
 
-### Seeing what it actually does
-
-Four utilities, each answering one question the source otherwise only
-answers by being read. `docs/ARCHITECTURE.md` is written from their output.
-
-```bash
-make inspect-chunks      # what does the gateway DO to this audio?
-                         #   offline — needs nothing running
-make inspect-trace       # where does the TIME go?
-                         #   live — one session, every event stamped
-make inspect-fleet       # what is the fleet, as the ROUTER sees it?
-make vad-economics       # what does gating silence actually save?
-```
-
-`make inspect-chunks` is the one to start with: it needs no stack, and
-chunking is where most of this system's behaviour originates.
-
-### The fleet
-
-One worker image, five adapters, selected per container by `ADAPTER`.
-Weights are baked in at build time by `models/fetch.sh` and never fetched
-at run time.
-
-| Worker | Adapter | Family | Runtime | Streaming | Serializable |
-|---|---|---|---|---|---|
-| `worker-a` | `zipformer` | transducer | sherpa-onnx | yes | no |
-| `worker-b` | `zipformer` | transducer | sherpa-onnx | yes | no |
-| `worker-c` | `conformer_ctc` | CTC | sherpa-onnx | yes | no |
-| `worker-d` | `whisper_ct2` | enc-dec | CTranslate2 | **no** | no |
-| `worker-e` | `whisper_onnx` | enc-dec | ONNX Runtime | **no** | no |
-| `worker-mock` | `mock` | — | — | yes | **yes** |
-
-Four rows of that table are load-bearing:
-
-- **a and b advertise one compatibility key.** A failover between them is
-  the cheap path — and since neither can serialize state, it visibly
-  *degrades* to audio replay. That degradation is the finding, not a gap.
-- **c is a different family.** Transducer state is structurally
-  meaningless to CTC, so a→c must build fresh state and replay.
-- **d and e load the same weights under different runtimes**, and are
-  still cache-incompatible. The subtlest case in the design, and the one
-  people get wrong; the transcript visibly changes across that failover.
-- **d and e cannot stream at all.** They are healthy backends the router
-  must *refuse* for an online session rather than mis-serve.
-
-`worker-mock` is the only serializable adapter, so it is the only place
-the warm-checkpoint tier is real. Measured RTF per adapter:
-[docs/RTF.md](docs/RTF.md).
-
-### Troubleshooting
-
-**Port 7000 already in use, on macOS.** AirPlay Receiver (ControlCenter)
-listens on host port 7000 by default since macOS Monterey. Either disable
-it (System Settings → General → AirDrop & Handoff → AirPlay Receiver) or
-remap the host port, e.g. `GATEWAY_DASHBOARD_PORT=7001 make up` — the
-container's own port is unaffected either way.
+**Port 7000 on macOS.** AirPlay Receiver listens there by default since
+Monterey. Either disable it (System Settings → General → AirDrop & Handoff)
+or remap: `GATEWAY_DASHBOARD_PORT=7001 make live`. `scripts/live.sh` detects
+the clash and moves to 7001 on its own.
 
 ## Design and build plan
 
+**Start with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** — what happens
+to a stream of audio, end to end: chunking, dispatch, where every piece of
+state lives, what each step costs. Written from measured output, not prose.
+
+- [`docs/KVCACHE.md`](docs/KVCACHE.md) — the KV cache and the stateless
+  path: what the three families' caches actually contain, the shared tier,
+  version lifecycle, what it costs, and the one known gap.
+- [`docs/KVCACHE-ALTERNATIVES.md`](docs/KVCACHE-ALTERNATIVES.md) — every
+  design considered and rejected, with the number that settled it: Bifrost
+  owning the cache, recompute-style statelessness, Mooncake, token paging.
+- [`docs/KVCACHE-DEEPDIVE.md`](docs/KVCACHE-DEEPDIVE.md) — background: KV
+  caches from first principles, then how vLLM, SGLang, LMCache and NIXL
+  allocate, identify, evict, shrink, move and route to them.
+- [`docs/DASHBOARD.md`](docs/DASHBOARD.md) — the operator view and the
+  microphone client, panel by panel.
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the wire contract: client↔gateway
+  framing and gateway↔backend HTTP surface.
+- [`docs/STATUS.md`](docs/STATUS.md) — living tracker: what is built and
+  verified vs. pending, per milestone.
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — every question the design left
+  open, resolved once, up front.
+- [`docs/FAQ.md`](docs/FAQ.md) — the reasoning behind locked decisions that
+  are not self-evident from a one-line table entry.
 - [`docs/build-plan.md`](docs/build-plan.md) — the architecture and thesis:
   principles, invariants, protocol, failover algorithms, benchmarks.
 - [`docs/implementation-plan.md`](docs/implementation-plan.md) — the
-  executable milestone plan (M0–M10), the interface contracts that make it
-  buildable, and the model fleet.
-- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the wire contract: client↔gateway
-  framing and gateway↔backend HTTP surface.
-- [`docs/DECISIONS.md`](docs/DECISIONS.md) — every question the design left
-  open, resolved once, up front.
-- [`docs/STATUS.md`](docs/STATUS.md) — living tracker: what's built and
-  verified vs. pending, per milestone.
-- [`docs/FAQ.md`](docs/FAQ.md) — the reasoning behind locked decisions that
-  aren't self-evident from a one-line table entry.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — **start here.** What
-  happens to a stream of audio, end to end: chunking, dispatch, where every
-  piece of state lives, what each step costs. Written from measured output,
-  not prose.
-- [`docs/BIFROST-KVCACHE.md`](docs/BIFROST-KVCACHE.md) — why Bifrost is used
-  for stateless transcription work but cannot own a live ASR KV cache.
+  executable milestone plan and the interface contracts that make it
+  buildable.
 - [`docs/BENCH.md`](docs/BENCH.md) — the frozen `cmd/loadgen` contract and
   the corpus's clip kinds.
-- [`docs/RTF.md`](docs/RTF.md) — measured real-time factor per adapter,
-  generated by `make rtf` rather than written by hand.
+- [`docs/RTF.md`](docs/RTF.md) — measured real-time factor per adapter.
+- [`docs/INTERVIEW-READING-LIST.md`](docs/INTERVIEW-READING-LIST.md) — an
+  ordered reading plan for transformers, KV caches, vLLM, Mooncake, and
+  this repository's state model.
 
 ## Repository layout
 
 ```
-cmd/gateway, cmd/loadgen   Go binaries
+cmd/gateway                Go: the gateway
+cmd/kvtier                 Go: the shared per-family KV tier
+cmd/loadgen, cmd/chaostest Go: load generation and failover scenarios
 internal/audio             ALL sample-level code lives here — see the audio
                             boundary in implementation-plan.md — and nowhere
                             else in this repository
-internal/{wire,session,journal,router,backend,coord,metrics,dash}
-worker/                    Python worker: HTTP surface + model adapters
+internal/{wire,session,journal,router,backend,coord,bifrost,metrics,dash}
+worker/                    Python worker: HTTP surface, model adapters,
+                            kvcache/ (the tensors), kvtier.py (the client)
 corpus/                    committed known-text clips for ground-truth tests
 scripts/                   setup, chaos scenarios, benchmarks — checked in,
                             not run ad hoc
@@ -126,6 +145,9 @@ scripts/                   setup, chaos scenarios, benchmarks — checked in,
 
 ## Not implemented yet, and why
 
-Tracked live in [`docs/STATUS.md`](docs/STATUS.md). This section will carry
-the final list at M10, per the design doc's own requirement that omissions
-be stated as choices.
+Tracked live in [`docs/STATUS.md`](docs/STATUS.md), with the KV-specific
+list at the end of [`docs/KVCACHE.md`](docs/KVCACHE.md). The largest
+standing items: zero-copy state transfer over `/dev/shm`, write-behind tier
+publishing, cache-aware routing on resident state, a router-side background
+prober, and an offline path that stops opening worker handles it never
+reads.

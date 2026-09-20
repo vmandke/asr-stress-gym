@@ -18,7 +18,7 @@ accumulated encoder and predictor context built from exactly that audio.
 
 For the complete design rationale — including why a Bifrost response cache,
 provider fallback, or a model prefix cache cannot stand in for a live ASR KV
-cache — see [Bifrost and KV cache](../docs/BIFROST-KVCACHE.md).
+cache — see [Bifrost and KV cache](../docs/KVCACHE-ALTERNATIVES.md).
 
 ## Off by default
 
