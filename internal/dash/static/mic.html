@@ -236,8 +236,8 @@
 
 // ---- protocol constants, from docs/PROTOCOL.md ----------------------
 const SAMPLE_RATE   = 16000;         // locked; the gateway refuses anything else
-const FRAME_MS      = 20;            // nominal_frame_ms
-const FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000;  // 320
+const FRAME_MS      = 80;            // nominal_frame_ms: four 20ms VAD windows
+const FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000;  // 1280
 const HEADER        = 17;            // type(1) + seq(8) + capture_ms(4) + num_samples(4)
 const TYPE_AUDIO    = 1, TYPE_CONTROL = 2;
 
@@ -280,7 +280,7 @@ $("wsurl").value = localStorage.getItem("mic.ws") || defaultWs();
 $("wsurl").addEventListener("change", () => localStorage.setItem("mic.ws", $("wsurl").value.trim()));
 
 let ws = null, audioCtx = null, micStream = null, workletNode = null, srcNode = null;
-let running = false, seq = 0, startedAt = 0, sessionId = null;
+let running = false, starting = false, seq = 0, startedAt = 0, sessionId = null;
 let pending = new Float32Array(0);       // carry between worklet blocks
 let stats = { frames: 0, partials: 0, finals: 0, failovers: 0, acked: null };
 let liveEl = null, pollTimer = null, kvTimer = null, myCompatKey = null;
@@ -334,9 +334,13 @@ function commitFinal(text) {
 // ---- the session ----------------------------------------------------
 async function start() {
   if (running) return stop();
+  if (starting) return;
+  starting = true;
+  $("btn").disabled = true;
+  setState("requesting microphone", "warn");
 
   if (!navigator.mediaDevices?.getUserMedia) {
-    $("hint").textContent = "Microphone needs a secure context — use http://localhost, not an IP.";
+    startFailed("Microphone needs a secure context — use http://localhost, not an IP.");
     return;
   }
 
@@ -345,53 +349,65 @@ async function start() {
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
   } catch (e) {
-    $("hint").textContent = "Microphone denied: " + e.message;
+    startFailed("Microphone denied: " + e.message);
     return;
   }
 
-  // Ask for 16 kHz directly so the browser resamples in its own audio
-  // graph. Some browsers ignore the hint, so the tap resamples too — the
-  // gateway rejects any rate but 16000 rather than transcoding.
-  try { audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE }); }
-  catch { audioCtx = new AudioContext(); }
-  await audioCtx.resume();
-  const ratio = audioCtx.sampleRate / SAMPLE_RATE;
-  if (Math.abs(ratio - 1) > 0.001) {
-    $("hint").textContent = `browser gave ${audioCtx.sampleRate} Hz; resampling to 16000`;
-  } else {
-    $("hint").textContent = "";
-  }
+  try {
+    // Ask for 16 kHz directly so the browser resamples in its own audio
+    // graph. Some browsers ignore the hint, so the tap resamples too — the
+    // gateway rejects any rate but 16000 rather than transcoding.
+    try { audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE }); }
+    catch { audioCtx = new AudioContext(); }
+    await audioCtx.resume();
+    const ratio = audioCtx.sampleRate / SAMPLE_RATE;
+    if (Math.abs(ratio - 1) > 0.001) {
+      $("hint").textContent = `browser gave ${audioCtx.sampleRate} Hz; resampling to 16000`;
+    } else {
+      $("hint").textContent = "";
+    }
 
-  const url = $("wsurl").value.trim() || defaultWs();
-  setState("connecting", "warn");
-  ws = new WebSocket(url);
-  ws.binaryType = "arraybuffer";
+    const url = $("wsurl").value.trim() || defaultWs();
+    setState("connecting", "warn");
+    const socket = new WebSocket(url);
+    ws = socket;
+    socket.binaryType = "arraybuffer";
 
-  ws.onopen = async () => {
-    seq = 0; startedAt = performance.now(); sessionId = null;
-    stats = { frames: 0, partials: 0, finals: 0, failovers: 0, acked: null };
-    pending = new Float32Array(0);
+    socket.onopen = async () => {
+      if (ws !== socket || !starting) return socket.close();
+      try {
+        seq = 0; startedAt = performance.now(); sessionId = null;
+        stats = { frames: 0, partials: 0, finals: 0, failovers: 0, acked: null };
+        pending = new Float32Array(0);
 
-    ws.send(encodeControl(seq++, {
-      type: "session.start",
-      mode: "online",
-      sample_rate_hz: SAMPLE_RATE,
-      encoding: "pcm_s16le",
-      channels: 1,
-      nominal_frame_ms: FRAME_MS,
-    }));
-    log("session.start", "online 16000 pcm_s16le");
+        socket.send(encodeControl(seq++, {
+          type: "session.start",
+          mode: "online",
+          sample_rate_hz: SAMPLE_RATE,
+          encoding: "pcm_s16le",
+          channels: 1,
+          nominal_frame_ms: FRAME_MS,
+        }));
+        log("session.start", "online 16000 pcm_s16le");
 
-    await startTap(ratio);
-    running = true;
-    $("btn").textContent = "Stop";
-    $("btn").classList.add("rec");
-    setState("streaming", "on");
-    pollTimer = setInterval(pollSession, 1000);
-    kvTimer = setInterval(pollKV, 1500);
-  };
+        // Set this before connecting the tap. The first worklet block can
+        // arrive immediately, and it must belong to this just-opened session.
+        running = true;
+        await startTap(ratio);
+        starting = false;
+        $("btn").disabled = false;
+        $("btn").textContent = "Stop";
+        $("btn").classList.add("rec");
+        setState("streaming", "on");
+        pollTimer = setInterval(pollSession, 1000);
+        kvTimer = setInterval(pollKV, 1500);
+      } catch (e) {
+        if (ws === socket) startFailed("Microphone capture failed: " + e.message);
+      }
+    };
 
-  ws.onmessage = ev => {
+    socket.onmessage = ev => {
+      if (ws !== socket) return;
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.session_id && !sessionId) { sessionId = m.session_id; $("sid").textContent = sessionId; }
 
@@ -416,26 +432,60 @@ async function start() {
         // legitimate. Under background load this is the expected refusal.
         log("overloaded", `${m.reason} — retry in ${m.retry_after_ms}ms`);
         $("hint").textContent = `gateway refused the session: ${m.reason}. Retryable.`;
+        stop(false);
         setState("overloaded", "warn");
-        stop();
         break;
       case "error":
         log("error", m.reason);
         $("hint").textContent = "session error: " + m.reason;
+        stop(false);
         setState("error", "err");
-        stop();
         break;
     }
     refresh();
-  };
+    };
 
-  ws.onerror = () => { setState("ws error", "err"); log("error", "websocket failed — is the gateway up?"); };
-  ws.onclose = () => { if (running) stop(); setState("closed"); };
+    socket.onerror = () => {
+      if (ws !== socket) return;
+      if (starting) return startFailed("WebSocket failed — is the gateway up?");
+      setState("ws error", "err");
+      log("error", "websocket failed — is the gateway up?");
+    };
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      stop(false);
+      setState("closed");
+    };
+  } catch (e) {
+    startFailed("Microphone setup failed: " + e.message);
+  }
+}
+
+function startFailed(message) {
+  log("error", message);
+  $("hint").textContent = message;
+  stop(false);
+  setState("error", "err");
 }
 
 // The audio tap: one AudioWorklet posting raw blocks, reframed here into
-// exact 20ms frames. Kept in a Blob so this page stays a single file.
+// exact 80ms transport frames. Kept in a Blob so this page stays a single file.
 async function startTap(ratio) {
+  srcNode = audioCtx.createMediaStreamSource(micStream);
+  const mute = audioCtx.createGain();
+  mute.gain.value = 0;
+
+  const connect = node => {
+    srcNode.connect(node);
+    node.connect(mute);
+    mute.connect(audioCtx.destination);
+  };
+
+  // AudioWorklet is the preferred low-latency path. Older Safari/WebKit
+  // builds can expose getUserMedia but not a usable AudioWorklet; use the
+  // built-in ScriptProcessor only there instead of failing silently.
+  if (audioCtx.audioWorklet && typeof AudioWorkletNode === "function") {
+    try {
   const src = `
     class PCMTap extends AudioWorkletProcessor {
       process(inputs) {
@@ -446,25 +496,24 @@ async function startTap(ratio) {
     }
     registerProcessor('pcm-tap', PCMTap);`;
   const blobUrl = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
-  await audioCtx.audioWorklet.addModule(blobUrl);
-  URL.revokeObjectURL(blobUrl);
+      try { await audioCtx.audioWorklet.addModule(blobUrl); }
+      finally { URL.revokeObjectURL(blobUrl); }
+      workletNode = new AudioWorkletNode(audioCtx, "pcm-tap");
+      workletNode.port.onmessage = e => onBlock(e.data, ratio);
+      connect(workletNode);
+      return;
+    } catch (e) {
+      log("capture", "AudioWorklet unavailable; using browser fallback");
+    }
+  }
 
-  srcNode = audioCtx.createMediaStreamSource(micStream);
-  workletNode = new AudioWorkletNode(audioCtx, "pcm-tap");
-  workletNode.port.onmessage = e => onBlock(e.data, ratio);
-
-  // Through a muted gain node to the destination: an AudioWorkletNode that
-  // reaches no sink is not guaranteed to be pulled, and connecting it
-  // audibly would feed the microphone straight back to the speakers.
-  const mute = audioCtx.createGain();
-  mute.gain.value = 0;
-  srcNode.connect(workletNode);
-  workletNode.connect(mute);
-  mute.connect(audioCtx.destination);
+  workletNode = audioCtx.createScriptProcessor(1024, 1, 1);
+  workletNode.onaudioprocess = e => onBlock(e.inputBuffer.getChannelData(0).slice(), ratio);
+  connect(workletNode);
 }
 
 function onBlock(block, ratio) {
-  if (!running && stats.frames > 0) return;
+  if (!running) return;
 
   if (Math.abs(ratio - 1) > 0.001) block = resample(block, ratio);
 
@@ -501,22 +550,30 @@ function resample(input, ratio) {
   return out;
 }
 
-function stop() {
+function stop(finalize = true) {
+  const socket = ws;
+  ws = null;
   running = false;
+  starting = false;
+  $("btn").disabled = false;
   $("btn").textContent = "Start";
   $("btn").classList.remove("rec");
   $("level").style.width = "0%";
   clearInterval(pollTimer); pollTimer = null;
   clearInterval(kvTimer); kvTimer = null;
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      // Graceful finalization: flush pending audio and emit the final for
-      // the open utterance (docs/PROTOCOL.md session.end).
-      ws.send(encodeControl(seq++, { type: "session.end" }));
-      log("session.end", "");
-      setTimeout(() => { try { ws.close(); } catch {} }, 700);
-    } catch {}
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    if (finalize) {
+      try {
+        // Graceful finalization: flush pending audio and emit the final for
+        // the open utterance (docs/PROTOCOL.md session.end).
+        socket.send(encodeControl(seq++, { type: "session.end" }));
+        log("session.end", "");
+        setTimeout(() => { try { socket.close(); } catch {} }, 700);
+      } catch {}
+    } else {
+      socket.close();
+    }
   }
   workletNode?.port && (workletNode.port.onmessage = null);
   try { srcNode?.disconnect(); workletNode?.disconnect(); } catch {}
@@ -558,7 +615,7 @@ const bytes = n =>
   : n + " B";
 
 // Chunking and VAD gating, straight from the gateway's own per-stream
-// counters. Frames arrive every 20ms; the VAD decides which of them reach
+// counters. Frames arrive every 80ms; the VAD decides which of them reach
 // the chunker, and the chunker accumulates by DURATION (invariant 2), so
 // "avg chunk" is derived from bytes rather than assumed to be 160ms.
 function renderChunking(s) {
@@ -576,9 +633,9 @@ function renderChunking(s) {
   $("vadBar").querySelector(".gated").style.width = (gated / total * 100) + "%";
   $("cVoiced").textContent = `${voiced.toLocaleString()} (${(voiced / total * 100).toFixed(0)}%)`;
   $("cGated").textContent = `${gated.toLocaleString()} (${(gated / total * 100).toFixed(0)}%)`;
-  // Every 20ms frame the VAD drops is audio the chunker never accumulates,
+  // Every transport frame the VAD drops is audio the chunker never accumulates,
   // so the saving is in whole backend calls, not in bytes.
-  $("cAvoided").textContent = chunkMs ? Math.floor(gated * 20 / chunkMs).toLocaleString() : "0";
+  $("cAvoided").textContent = chunkMs ? Math.floor(gated * FRAME_MS / chunkMs).toLocaleString() : "0";
 }
 
 // What the cache actually holds. Read from the worker's /v1/kv/layout,

@@ -112,8 +112,9 @@ Four facts in that table carry the whole design:
 
 ## 2. The client sends a frame
 
-A client emits **20 ms frames at 16 kHz mono s16le** — 320 samples, 640
-bytes — paced on a wall-clock ticker, roughly 50 per second.
+A client emits **80 ms transport frames at 16 kHz mono s16le** — 1,280
+samples, 2,560 bytes — paced on a wall-clock ticker, roughly 12.5 per
+second. Each frame contains four 20 ms VAD windows.
 
 ```
 byte 0        type         1 = AUDIO, 2 = CONTROL
@@ -123,8 +124,8 @@ bytes 13-16   num_samples  uint32   ← the payload's own duration
 bytes 17+     payload      PCM s16le, or UTF-8 JSON for CONTROL
 ```
 
-Binary, not JSON: base64 would inflate every payload by a third, 50 times
-a second, per stream.
+Binary, not JSON: base64 would inflate every payload by a third, on every
+transport frame, per stream.
 
 **`num_samples` is authoritative and never inferred from arrival cadence
 or message size** — invariant 1. The gateway computes
@@ -137,7 +138,7 @@ the session closes. This is deliberately harsher than a sequence gap
 unverified framing risks exactly the silent corruption invariant 1 exists
 to prevent.
 
-A client may batch several nominal frames into one message. Nothing
+A client may batch several transport frames into one message. Nothing
 downstream changes, because accumulation is by duration — see §4.
 
 ---
@@ -180,14 +181,14 @@ contend over.
 `make inspect-chunks` runs this offline, against the real
 `internal/audio`, with no gateway and no worker.
 
-**A model is never called per frame.** Frames arrive every 20 ms; calling
-a backend 50 times a second per stream would spend the entire latency
-budget on HTTP. Instead the pipeline accumulates until **160 ms of
-declared duration** has arrived, then cuts one `Chunk`:
+**A model is never called per frame.** Transport frames arrive every 80 ms;
+calling a backend for each would still couple model work to network framing.
+Instead the pipeline accumulates until **160 ms of declared duration** has
+arrived, then cuts one `Chunk`:
 
 ```
-frames   20ms 20ms 20ms 20ms 20ms 20ms 20ms 20ms │ 20ms 20ms ...
-         └────────────── 160 ms ─────────────────┘
+frames   80ms 80ms │ 80ms 80ms ...
+         └── 160 ms ─┘
                                           cut ──▶ Chunk{ID, SeqStart, SeqEnd, Bytes}
 ```
 
@@ -195,8 +196,8 @@ frames   20ms 20ms 20ms 20ms 20ms 20ms 20ms 20ms │ 20ms 20ms ...
 frames per message produces the same chunk count as one sending singles.
 That is invariant 2, and it is why `num_samples` is authoritative.
 
-Before accumulating, each frame is VAD-tagged. Here is a real
-silence-heavy clip, one character per 20 ms frame:
+Before accumulating, every transport frame is reframed and VAD-tagged. Here
+is a real silence-heavy clip, one character per internal 20 ms VAD window:
 
 ```
      0.0s ##############################.........###################################.....#####################

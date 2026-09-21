@@ -28,8 +28,8 @@ live:
 # Microphone capture needs a secure context, and localhost counts as one —
 # so open the printed URL rather than a LAN IP.
 mic:
-	@port=$${GATEWAY_DASHBOARD_PORT:-7000}; \
-	 lsof -nP -iTCP:$$port -sTCP:LISTEN >/dev/null 2>&1 || true; \
+	@port="$$(docker ps --filter label=com.docker.compose.project=asr-stress-gym --filter label=com.docker.compose.service=gateway --format '{{.Ports}}' 2>/dev/null | sed -nE 's/.*:([0-9]+)->7000\/tcp.*/\1/p' | head -n 1)"; \
+	 port=$${port:-$${GATEWAY_DASHBOARD_PORT:-7000}}; \
 	 echo "open http://localhost:$$port/dashboard/mic.html"
 
 # Does the mic page's own framing code speak this gateway's protocol?

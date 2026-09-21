@@ -63,6 +63,8 @@
   .node.degraded { border-left-color: var(--warn); }
   .node.ejected, .node.down { border-left-color: var(--bad); }
   .node.draining { border-left-color: var(--violet); }
+  .node.killing { outline: 1px solid var(--bad); animation: kill-pulse .8s ease-in-out infinite alternate; }
+  @keyframes kill-pulse { to { box-shadow: 0 0 0 3px #f8514933; } }
   .node .top { display: flex; justify-content: space-between; align-items: baseline; }
   .node .id { font-weight: 600; }
   .node .model { color: var(--dim); font-size: 11px; margin: 1px 0 5px; }
@@ -79,6 +81,8 @@
     color: var(--ink); background: #0d1117; border: 1px solid var(--line); cursor: pointer; }
   .quick .kill { color: var(--bad); border-color: #5b2429; }
   .quick .restore { color: var(--ok); border-color: #1d572b; }
+  .action-state { color: var(--bad); font-size: 10px; font-weight: 600; margin-top: 5px; }
+  .action-state.restore { color: var(--ok); }
   .fleet-add { color: var(--ok) !important; border-color: #1d572b !important; }
   .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 6px; overflow: hidden; }
   .bar > i { display: block; height: 100%; background: var(--accent); }
@@ -229,7 +233,7 @@
 const S = {
   snap: null, nodes: { order: [], series: {}, latest: [] },
   lat: [], traffic: [], marks: [], prevPushes: null,
-  selStream: null, log: [], tab: "traffic",
+  selStream: null, log: [], tab: "traffic", actions: {},
 };
 const WINDOW_MS = 4 * 60 * 1000;
 
@@ -366,14 +370,23 @@ function renderFleet() {
   for (const w of workers) {
     const n = nodeByName(w.id) || {};
     const down = n.ok === false;
+    const action = S.actions[w.id];
+    if (action?.name === "kill" && down) action.confirmed = true;
+    if (action?.name === "restore" && !down) action.confirmed = true;
     const r = ejectRatio(w), limit = f.eject_at_multiple || 3;
     const d = document.createElement("div");
-    d.className = "node " + (down ? "down" : w.status) + (w.draining ? " draining" : "");
+    d.className = "node " + (down ? "down" : w.status) + (w.draining ? " draining" : "") +
+      (action?.name === "kill" && !action.confirmed ? " killing" : "");
 
     // Why this node is out of rotation, stated in the rule's own terms.
     // "ejected" is a verdict; this is the evidence.
     let why = "";
-    if (down) why = `<span style="color:var(--bad)">process is not answering</span>`;
+    if (action?.failed) why = `<span style="color:var(--bad)">${esc(action.failed)}</span>`;
+    else if (action?.name === "kill" && !action.confirmed) why = `<span style="color:var(--bad)">SIGKILL sent — waiting for the health probe to confirm it</span>`;
+    else if (action?.name === "kill" && action.confirmed) why = `<span style="color:var(--bad)">SIGKILL confirmed — process is down</span>`;
+    else if (action?.name === "restore" && !action.confirmed) why = `<span style="color:var(--ok)">restore sent — waiting for the worker to become healthy</span>`;
+    else if (action?.name === "restore" && action.confirmed) why = `<span style="color:var(--ok)">restore confirmed — worker is answering</span>`;
+    else if (down) why = `<span style="color:var(--bad)">process is not answering</span>`;
     else if (w.draining) why = `<span style="color:var(--violet)">drained — no new sessions</span>`;
     else if (!w.streaming) why = `<span style="color:var(--dim)">offline family — online never routes here</span>`;
     else if (w.status === "ejected") why = `<span style="color:var(--bad)">ejected: p95 ${r.toFixed(1)}× cluster (limit ${limit}×)</span>`;
@@ -385,7 +398,7 @@ function renderFleet() {
     d.innerHTML =
       `<div class="top"><span class="id"><i style="display:inline-block;width:7px;height:7px;border-radius:2px;` +
         `background:${colorFor(w.id)};margin-right:5px"></i>${w.id}</span>` +
-        `<span class="d" style="font-size:10px;color:var(--dim)">${down ? "DOWN" : (w.draining ? "DRAINING" : w.status)}</span></div>` +
+        `<span class="d" style="font-size:10px;color:var(--dim)">${action?.name === "kill" && !action.confirmed ? "KILLING…" : (action?.name === "kill" && action.confirmed ? "KILLED" : (action?.name === "restore" && !action.confirmed ? "RESTORING…" : (down ? "DOWN" : (w.draining ? "DRAINING" : w.status))))}</span></div>` +
       `<div class="model">${esc(w.model || "unknown model")}</div>` +
       `<div class="badges">` +
         (w.streaming ? `<span class="badge stream">streaming</span>` : `<span class="badge batch">offline</span>`) +
@@ -397,8 +410,8 @@ function renderFleet() {
         `<span>${fmtBytes(n.mem_bytes)}</span></div>` +
       `<div class="bar"><i class="${memCls}" style="width:${Math.min(100, pct || 0)}%"></i></div>` +
       (why ? `<div class="why">${why}</div>` : "") +
-      `<div class="quick"><button class="kill" data-action="kill">kill</button>` +
-      `<button class="restore" data-action="restore">restore</button></div>`;
+      `<div class="quick"><button class="kill" data-action="kill" ${action && !action.confirmed && !action.failed ? "disabled" : ""}>kill</button>` +
+      `<button class="restore" data-action="restore" ${action && !action.confirmed && !action.failed ? "disabled" : ""}>restore</button></div>`;
     d.querySelectorAll("[data-action]").forEach((b) => {
       b.onclick = (e) => { e.stopPropagation(); fire(w.id, b.dataset.action); };
     });
@@ -442,8 +455,24 @@ function openMenu(e, worker) {
 document.addEventListener("click", () => { $("menu").style.display = "none"; });
 
 async function fire(worker, path) {
-  try { await fetch(`/api/chaos/${worker}/${path}`, { method: "POST" }); }
-  catch (err) { console.warn("chaos", err); }
+  const name = path.split("?")[0];
+  const observable = name === "kill" || name === "restore";
+  if (observable) {
+    S.actions[worker] = { name, confirmed: false };
+    renderFleet();
+  }
+  try {
+    const response = await fetch(`/api/chaos/${worker}/${path}`, { method: "POST" });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || `request failed (${response.status})`);
+    }
+  } catch (err) {
+    if (observable) S.actions[worker] = { name, failed: `${name} failed: ${err.message}` };
+    else $("fleet-note").textContent = `${name} failed for ${worker}: ${err.message}`;
+    console.warn("chaos", err);
+    renderFleet();
+  }
 }
 
 document.querySelectorAll("[data-load]").forEach((b) => {
@@ -704,7 +733,7 @@ function renderFlow() {
   $("flow").innerHTML =
     box("", "client → gateway",
       `${s.frames_in} frames`,
-      `${(s.audio_ms_in / 1000).toFixed(1)}s audio · 20ms/frame · seq ${s.last_seq}`) +
+      `${(s.audio_ms_in / 1000).toFixed(1)}s audio · transport frames · seq ${s.last_seq}`) +
     box("", "VAD gate",
       `${gatedPct.toFixed(0)}% gated`,
       `${s.frames_voiced} speech / ${s.frames_gated} silence — gated frames are journaled but never sent`) +

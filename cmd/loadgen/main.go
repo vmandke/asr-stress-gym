@@ -36,17 +36,18 @@ import (
 	"asr-stress-gym/internal/corpus"
 )
 
-// nominalFrameMs is the frame cadence every stream paces itself on: 20ms
-// at 16kHz is 320 samples, the size docs/PROTOCOL.md uses throughout.
+// nominalFrameMs is the default transport cadence every stream paces itself
+// on. 80ms is four complete 20ms VAD windows: coarse enough to reduce the
+// WebSocket/frame overhead by 4x, yet aligned with WebRTC VAD's windowing.
 // Pacing is by wall clock, never by "send as fast as possible" — an
 // unpaced generator measures the gateway's queue depth rather than its
 // latency.
 const (
-	nominalFrameMs   = 20
+	nominalFrameMs   = 80
 	sampleRateHz     = 16000
 	bytesPerSample   = 2
-	frameSamples     = sampleRateHz * nominalFrameMs / 1000 // 320
-	frameBytes       = frameSamples * bytesPerSample        // 640
+	frameSamples     = sampleRateHz * nominalFrameMs / 1000 // 1280
+	frameBytes       = frameSamples * bytesPerSample        // 2560
 	eventChanBuffer  = 4096
 	finalWaitTimeout = 20 * time.Second
 )

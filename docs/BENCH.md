@@ -47,6 +47,10 @@ speech content rather than against the `--speech-ratio` it asked for.
 holding all ~200MB resident would make the generator larger than the
 gateway it is measuring.
 
+The default transport frame is **80 ms** (1,280 mono 16 kHz samples), paced
+at 12.5 writes per second. It is deliberately independent of the gateway's
+160 ms online inference chunk and its internal 20 ms VAD windows.
+
 ## `cmd/loadgen` — command-line surface
 
 ```

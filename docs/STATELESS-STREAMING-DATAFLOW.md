@@ -72,7 +72,8 @@ This is the durable-in-memory recovery material. If a state version disappears,
 the gateway can recompute it by replaying audio; it never invents missing
 model context.
 
-The gateway then passes PCM to the WebRTC VAD pipeline. Transport frames are
+The gateway then passes PCM to the WebRTC VAD pipeline. Clients send 80 ms
+transport frames (four complete detector windows) by default; they are
 reframed to 20 ms detector windows. The current policy is:
 
 | Setting | Value | Effect |
@@ -247,4 +248,3 @@ tiers. Those are capacity and availability improvements; they do not change
 the central correctness rule: only an exact compatibility-key match can read a
 state blob, and missing state is rebuilt from journaled audio rather than
 guessed.
-
