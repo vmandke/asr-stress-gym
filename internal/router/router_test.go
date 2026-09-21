@@ -318,6 +318,18 @@ func TestProbeReEjectsWithBackoffOnFailure(t *testing.T) {
 	}
 }
 
+func TestMarkUnhealthyImmediatelyRemovesADeadWorkerFromSelection(t *testing.T) {
+	w := newTestWorker("worker-a", "K1", streamingCaps())
+	r := New([]*Worker{w})
+	r.MarkUnhealthy(w.ID)
+	if got := w.Status(); got != Ejected {
+		t.Fatalf("status = %v, want Ejected after direct health failure", got)
+	}
+	if _, err := r.Pick(session.ModeOnline, nil, ""); !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("Pick error = %v, want ErrNoCapacity for dead worker", err)
+	}
+}
+
 // The bug this test exists to catch: Pick evaluating (not necessarily
 // choosing) MULTIPLE ejected-and-expired candidates in one call must not
 // strand the non-chosen ones in a permanent probing=true state that no

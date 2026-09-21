@@ -6,9 +6,10 @@
 // one Router instance is constructed once in cmd/gateway/main.go and
 // shared (by reference) across every connection's sessionLoop.
 //
-// Health is entirely REACTIVE, not polled: build-plan.md's own Evaluate
-// is driven by observed outcomes (Report), so there is no background
-// health-check goroutine here. A worker's identity (CompatibilityKey,
+// Health normally comes from observed outcomes (Report). The gateway's
+// direct worker probe also calls MarkUnhealthy on a connection failure so
+// a dead worker is not selected again while Bifrost is still reporting a
+// stale provider configuration. A worker's identity (CompatibilityKey,
 // Capabilities) is learned once via Health() at startup
 // (cmd/gateway/main.go) and never changes for that worker's lifetime in
 // this process.
@@ -702,5 +703,21 @@ func (r *Router) Report(id string, ok bool, latency time.Duration) {
 			w.report(ok, latency, r.peerP95(w), now)
 			return
 		}
+	}
+}
+
+// MarkUnhealthy removes a worker from new-session selection immediately
+// after a direct /health probe cannot reach it. This is deliberately
+// stronger than recording one failed request: a Bifrost-routed session can
+// fail over before the gateway observes which provider failed, so waiting
+// for a rolling error rate would keep choosing a process known to be down.
+func (r *Router) MarkUnhealthy(id string) {
+	now := time.Now()
+	if w, ok := r.Find(id); ok {
+		w.mu.Lock()
+		if w.status != Ejected {
+			w.eject(now)
+		}
+		w.mu.Unlock()
 	}
 }

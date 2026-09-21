@@ -143,6 +143,17 @@ when the gateway opens a new session, or when Bifrost needs a fallback. Bifrost
 is not round-robining successful chunks across all workers in the current
 configuration.
 
+The gateway also probes each worker directly for the operator view. A failed
+probe immediately ejects that worker from *new-session* selection, even when
+Bifrost has not yet noticed its provider is dead. For an already-open
+stateless session, Bifrost first exhausts the same-key fallback list carried
+by that request. If the whole cohort is unavailable, the request ends with a
+clear shared-KV-cohort error. The gateway deliberately does **not** use its
+generic cross-family recovery in that case: that fallback would install a
+worker-local direct client and silently turn a stateless KVTier session into a
+pinned legacy session. It is safer and more truthful to fail than to claim
+shared-state continuity after the compatible cohort has disappeared.
+
 Using only a bare model alias cannot safely fix this. With one Bifrost provider
 per worker, Bifrost does not know compatibility keys or KVTier membership. A
 family-level Bifrost scheduler would have to enforce those invariants at

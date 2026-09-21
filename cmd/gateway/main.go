@@ -302,6 +302,7 @@ func nodeProbe(rt *router.Router) dash.NodeProbe {
 				s := dash.NodeSample{Node: wk.ID, AtMs: time.Now().UnixMilli()}
 				adv, err := wk.Client.Health(ctx)
 				if err != nil {
+					rt.MarkUnhealthy(wk.ID)
 					s.Detail = err.Error()
 					out[i] = s
 					return

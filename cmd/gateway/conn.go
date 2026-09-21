@@ -863,6 +863,19 @@ func dispatchChunk(ctx context.Context, c audio.Chunk, deps coord.RecoveryDeps, 
 		fromWorker := deps.State.WorkerID
 		fromKey := string(deps.State.CompatibilityKey)
 
+		// StatelessClient already gives Bifrost every compatible provider
+		// in its cohort. If all of those providers fail, falling through to
+		// coord's generic recovery would select an incompatible worker and
+		// replace this client with a worker-local, pinned client. That hides
+		// a shared-KV outage and makes the dashboard claim a stateless
+		// session that no longer uses KVTier. Fail cleanly instead: another
+		// same-family worker lets Bifrost recover before this point.
+		if _, stateless := (*client).(*backend.StatelessClient); stateless {
+			deps.Router.Report(fromWorker, false, 0)
+			trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("shared KV cohort unavailable: %v", err)))
+			return false
+		}
+
 		newClient, resetEv, regenerated, ferr := coord.HandleBackendFailure(ctx, deps, err)
 		if ferr != nil {
 			trySend(ctx, events, deps.Emitter.Error(fmt.Sprintf("failover exhausted: %v", ferr)))
