@@ -99,16 +99,6 @@
   .ctl button:disabled { opacity: .4; cursor: not-allowed; }
   .tabs button.on { border-color: var(--accent); color: var(--accent); }
 
-  #menu {
-    position: fixed; z-index: 20; background: var(--panel); border: 1px solid var(--line);
-    border-radius: 6px; padding: 6px; display: none; box-shadow: 0 8px 28px #0009; min-width: 210px;
-  }
-  #menu h3 { margin: 2px 6px 6px; font-size: 11px; color: var(--dim); font-weight: 600; }
-  #menu button { display: block; width: 100%; text-align: left; background: none; border: 0;
-    color: var(--ink); font: inherit; padding: 5px 8px; border-radius: 4px; cursor: pointer; }
-  #menu button:hover { background: #21262d; }
-  #menu button small { color: var(--dim); float: right; margin-left: 14px; }
-
   canvas { width: 100%; display: block; }
   .legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; margin-top: 6px; color: var(--dim); }
   .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; }
@@ -225,7 +215,6 @@
   </div>
 </div>
 
-<div id="menu"></div>
 
 <script>
 "use strict";
@@ -411,11 +400,11 @@ function renderFleet() {
       `<div class="bar"><i class="${memCls}" style="width:${Math.min(100, pct || 0)}%"></i></div>` +
       (why ? `<div class="why">${why}</div>` : "") +
       `<div class="quick"><button class="kill" data-action="kill" ${action && !action.confirmed && !action.failed ? "disabled" : ""}>kill</button>` +
-      `<button class="restore" data-action="restore" ${action && !action.confirmed && !action.failed ? "disabled" : ""}>restore</button></div>`;
+      `<button class="restore" data-action="restore" ${action && !action.confirmed && !action.failed ? "disabled" : ""}>restore</button>` +
+      `<button data-action="drain?on=${!w.draining}">${w.draining ? "return" : "drain"}</button></div>`;
     d.querySelectorAll("[data-action]").forEach((b) => {
       b.onclick = (e) => { e.stopPropagation(); fire(w.id, b.dataset.action); };
     });
-    d.onclick = (e) => openMenu(e, w.id);
     el.appendChild(d);
   }
 
@@ -425,34 +414,6 @@ function renderFleet() {
     `checkpoint; different key → full audio replay. Gray-failure rule: eject above ` +
     `<b>${f.eject_at_multiple || 3}×</b> the cluster p95 (now <b>${(f.cluster_p95_ms || 0).toFixed(1)}ms</b>).`;
 }
-
-const ACTIONS = [
-  ["kill", "", "SIGKILL the process"],
-  ["restore", "", "respawn it"],
-  ["drain?on=true", "", "no new sessions"],
-  ["drain?on=false", "", "back in rotation"],
-  ["blackhole?on=true", "", "accept, never answer"],
-  ["slow?ms=800", "", "+800ms per call"],
-  ["429?rate=0.5", "", "rate-limit half"],
-  ["corrupt?on=true", "", "invalidate checkpoints"],
-  ["reset", "", "clear request faults"],
-];
-
-function openMenu(e, worker) {
-  e.stopPropagation();
-  const m = $("menu");
-  m.innerHTML = `<h3>${worker}</h3>`;
-  for (const [path, , desc] of ACTIONS) {
-    const b = document.createElement("button");
-    b.innerHTML = `${path.split("?")[0]}${path.includes("on=false") ? " off" : ""}<small>${desc}</small>`;
-    b.onclick = () => { fire(worker, path); m.style.display = "none"; };
-    m.appendChild(b);
-  }
-  m.style.display = "block";
-  m.style.left = Math.min(e.clientX, innerWidth - m.offsetWidth - 12) + "px";
-  m.style.top = Math.min(e.clientY, innerHeight - m.offsetHeight - 12) + "px";
-}
-document.addEventListener("click", () => { $("menu").style.display = "none"; });
 
 async function fire(worker, path) {
   const name = path.split("?")[0];
