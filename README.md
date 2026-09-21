@@ -7,6 +7,43 @@ cache, routing, replay, failover and observability.
 > **Model cache accelerates recovery when compatible. Audio replay
 > guarantees recovery when it is not.**
 
+## Architecture
+
+The default online path is stateless after the gateway: every request carries
+only opaque references to its previous and next model-state versions. Bifrost
+routes those requests within one compatible model family; workers, not
+Bifrost, read and write the family-specific KV tier.
+
+```mermaid
+flowchart LR
+    C[Mic browser or load generator] -->|80 ms PCM frames| G[Gateway]
+    G --> V[VAD and utterance boundary]
+    V --> J[Gateway audio journal]
+    V --> R[Family and compatibility-key selection]
+    R -->|audio + opaque state_ref/state_sink| B[Bifrost]
+
+    B --> Z[Zipformer worker cohort]
+    B --> T[CTC worker cohort]
+
+    Z <--> ZH[Zip worker hot cache]
+    Z <--> ZK[(Zip KVTier)]
+    T <--> TH[CTC worker hot cache]
+    T <--> TK[(CTC KVTier)]
+
+    Z -->|partial or final transcript| G
+    T -->|partial or final transcript| G
+    G --> C
+
+    FM[Fleet manager, demo only] -. launches and registers workers .-> B
+```
+
+The gateway owns client sessions, VAD, the audio journal, family selection,
+and final transcript ordering. Each worker owns its local deserialized hot
+cache and persists immutable state versions to its own KVTier. Zipformer and
+CTC never share cache data: their tensors and compatibility keys differ.
+See [`docs/STATELESS-STREAMING-DATAFLOW.md`](docs/STATELESS-STREAMING-DATAFLOW.md)
+for the end-to-end implementation-level flow.
+
 ## Live dashboard
 
 The operator view shows the two streaming model families, their workers, live
