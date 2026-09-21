@@ -78,19 +78,18 @@ Four properties of that fleet are load-bearing:
 ```bash
 ./scripts/check_env.sh   # verify go/python/docker/compose are present
 make live                # the full stateless demo, above
-make start               # the default pinned stack
-make stateless-ab        # pinned vs stateless, measured side by side
-make stateless-proof     # prove chunks really fan out across a pool
 make chaos               # real-stack failover scenarios
 make dashboard           # bring the stack up and open the operator view
 make mic                 # open the microphone client
-make bench               # the frozen loadgen benchmark set
 make kv-quant            # fp32 / fp16 / int8 blob size vs text drift
 make test                # Go + Python suites
 make models              # fetch model weights
 make up / make down      # compose up --build / remove every demo container
 make reset               # make down, then remove Compose volumes too
 ```
+
+[`docs/CHAOS.md`](docs/CHAOS.md) explains the two live checks and their
+cleanup behavior.
 
 **Port 7000 on macOS.** AirPlay Receiver listens there by default since
 Monterey. Either disable it (System Settings → General → AirDrop & Handoff)
@@ -103,6 +102,9 @@ the clash and moves to 7001 on its own.
 to a stream of audio, end to end: chunking, dispatch, where every piece of
 state lives, what each step costs. Written from measured output, not prose.
 
+- [`docs/STATELESS-STREAMING-DATAFLOW.md`](docs/STATELESS-STREAMING-DATAFLOW.md)
+  — the current live path in detail: browser/client through VAD, admission,
+  gateway family selection, Bifrost, KVTier, worker threads and their queue.
 - [`docs/KVCACHE.md`](docs/KVCACHE.md) — the KV cache and the stateless
   path: what the streaming families' caches actually contain, the shared tier,
   version lifecycle, what it costs, and the one known gap.

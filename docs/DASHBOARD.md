@@ -2,8 +2,7 @@
 
 ```bash
 make dashboard      # docker compose up, then open the URL it prints
-make demo           # the same thing headlessly, with assertions
-make ha             # nginx L4 in front of two gateways
+make chaos          # run the live dynamic-fleet failure checks
 ```
 
 `http://localhost:7000/dashboard/` — or `:7001` if macOS AirPlay Receiver

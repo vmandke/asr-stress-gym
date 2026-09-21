@@ -1,45 +1,21 @@
-.PHONY: check start demo dashboard up down reset build test test-go test-worker models corpus chaos bench kv-quant stateless-ab stateless-proof live mic test-mic
+.PHONY: check dashboard chaos kv-quant live mic test-mic up down reset build test test-go test-worker models corpus
 
 # --- the demo ---------------------------------------------------------
 #
-# One command. Brings the stack up, revives anything earlier chaos killed,
-# prints the dashboard URL. It starts idle; STREAMS=n applies background load.
-start:
-	./scripts/start.sh $(STREAMS)
-
-# The same thing headlessly, with assertions: load, kill the busiest
-# worker, prove the sessions recovered and no final was duplicated.
-demo:
-	./scripts/demo.sh
-
 dashboard:
 	docker compose up -d --build
 	@echo "dashboard: http://localhost:$${GATEWAY_DASHBOARD_PORT:-7000}/dashboard/"
 
 # --- the evidence -----------------------------------------------------
 #
-# Chaos scenarios assert what the dashboard shows. 12 and 13 need the kv
-# profile (worker-f/g/h) and SKIP without it rather than failing.
+# Chaos checks exercise a Bifrost primary failure and admission overload in
+# the live dynamic-fleet topology. Run `make live` first; see docs/CHAOS.md.
 chaos:
 	./scripts/chaos.sh
 
-bench:
-	./scripts/bench.sh
-
 # What does quantizing the KV cache cost? (fp32 / fp16 / int8)
-kv-quant:
+kv-quant: worker/.venv/bin/pytest
 	cd worker && .venv/bin/python ../scripts/kv_quant_bench.py
-
-# Pinned vs stateless: the same online load run both ways, side by side.
-#   make stateless-ab            # 30 streams, 60s each
-#   make stateless-ab ARGS="8 20s"
-stateless-ab:
-	./scripts/stateless_ab.sh $(or $(ARGS),30 60s)
-
-# One session's chunks deliberately fanned across different workers in a
-# family, through Bifrost, proving the transcript survives it.
-stateless-proof:
-	python3 scripts/prove_stateless_bifrost.py
 
 # The whole live setup in one command: fleet + per-family KV tiers +
 # Bifrost + stateless streaming + load + the microphone page.
