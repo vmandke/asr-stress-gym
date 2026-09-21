@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import io
+import json
 import os
 import random
 import time
@@ -141,6 +143,29 @@ _fault_slow_ms = 0
 _fault_blackhole = False
 _fault_429_rate = 0.0
 _fault_corrupt = False
+
+# Bifrost v1.5 normalizes multipart transcription requests and discards
+# unknown form fields. The gateway therefore places KV *references* in the
+# standard OpenAI `prompt` field. This worker unwraps them before inference;
+# Bifrost never reads, writes, or carries KV bytes.
+_KV_PROMPT_PREFIX = "asr-stress-gym-kv:v1:"
+
+
+def _kv_prompt(prompt: str) -> tuple[str, str, str] | None:
+    if not prompt.startswith(_KV_PROMPT_PREFIX):
+        return None
+    try:
+        encoded = prompt[len(_KV_PROMPT_PREFIX):]
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        mode = payload["m"]
+        ref = payload.get("r", "")
+        sink = payload.get("s", "")
+        if mode not in ("stream", "final") or not all(isinstance(v, str) for v in (mode, ref, sink)):
+            raise ValueError("invalid fields")
+        return mode, ref, sink
+    except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+        raise ValueError("invalid KV prompt envelope") from e
 
 
 def _state_bytes() -> int:
@@ -339,6 +364,7 @@ async def audio_transcriptions(
     file: UploadFile = File(...),
     model: str = Form(default=""),
     response_format: str = Form(default="json"),
+    prompt: str = Form(default=""),
     state_ref: str = Form(default=""),
     state_sink: str = Form(default=""),
     kv_mode: str = Form(default=""),
@@ -367,13 +393,11 @@ async def audio_transcriptions(
     after, and docs/KVCACHE-ALTERNATIVES.md for the measurement that rules out
     the obvious alternative of shipping the tensors in the request.
 
-    **Why these are form fields.** Measured against Bifrost: unknown
-    multipart request fields are forwarded to the provider verbatim, while
-    unknown RESPONSE fields are stripped — Bifrost parses provider
-    responses into its own normalized schema. So state can travel IN
-    through Bifrost but cannot come back OUT. The design avoids needing it
-    to: the caller names the output reference up front, so the response
-    carries nothing but text.
+    **Why `prompt` carries the references.** Bifrost v1.5 strips unknown
+    multipart fields. `prompt` is part of the standard OpenAI transcription
+    shape and survives its normalization, so the gateway places a tiny,
+    versioned reference envelope there. It contains names only; the worker
+    still exchanges every KV byte directly with its own KVTier.
 
     That same stripping is why a cache miss is signalled as an HTTP STATUS
     rather than a response field. Status codes survive, and a miss genuinely
@@ -386,6 +410,14 @@ async def audio_transcriptions(
         pcm_bytes = _to_pcm(raw)
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+
+    if not kv_mode:
+        try:
+            forwarded = _kv_prompt(prompt)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+        if forwarded is not None:
+            kv_mode, state_ref, state_sink = forwarded
 
     if not kv_mode:
         def run() -> str:

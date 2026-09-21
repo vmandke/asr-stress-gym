@@ -317,6 +317,13 @@ func nodeProbe(rt *router.Router) dash.NodeProbe {
 				s.MemBytes = adv.CgroupMemoryBytes
 				s.MemLimit = adv.CgroupMemoryLimitBytes
 				s.UptimeS = adv.UptimeS
+				if adv.KVTier != nil && adv.KVTier.Enabled {
+					s.KVEnabled = true
+					s.KVTier = adv.KVTier.URL
+					s.KVLocalHits = adv.KVTier.LocalHits
+					s.KVTierHits = adv.KVTier.TierHits
+					s.KVMisses = adv.KVTier.Misses
+				}
 				if s.MemBytes == nil {
 					s.MemBytes = adv.RSSBytes // no cgroup: RSS is the honest stand-in
 				}

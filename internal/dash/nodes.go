@@ -77,6 +77,14 @@ type NodeSample struct {
 	HeapBytes   *int64   `json:"heap_bytes,omitempty"`
 	IsGateway   bool     `json:"is_gateway,omitempty"`
 	MemPctLimit *float64 `json:"mem_pct_limit,omitempty"`
+
+	// Shared-KV locality counters come from the worker's health response.
+	// They are cumulative process counters; the browser differences them.
+	KVEnabled   bool   `json:"kv_enabled,omitempty"`
+	KVTier      string `json:"kv_tier,omitempty"`
+	KVLocalHits int64  `json:"kv_local_hits,omitempty"`
+	KVTierHits  int64  `json:"kv_tier_hits,omitempty"`
+	KVMisses    int64  `json:"kv_misses,omitempty"`
 }
 
 // NodeProbe returns one sample per worker. cmd/gateway supplies it,

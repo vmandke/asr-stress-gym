@@ -7,7 +7,7 @@ processes actually do, rather than an idealized production system.
       | WebSocket, ordered PCM frames
       v
     gateway: validate, journal, VAD, choose compatibility cohort
-      | multipart HTTP: provider/model + state_ref + state_sink
+      | multipart HTTP: provider/model + opaque KV reference envelope
       v
     Bifrost: named primary, then same-family fallbacks
       v
@@ -98,9 +98,10 @@ request through Bifrost:
 
     model       = worker-zip-1/asr-1
     fallbacks   = worker-zip-dyn-1/asr-1
-    kv_mode     = stream
-    state_ref   = kv:s-abc:<previous N>   (absent for the first chunk)
-    state_sink  = kv:s-abc:<current N>
+    prompt      = asr-stress-gym-kv:v1:<base64url envelope>
+                  { mode: stream,
+                    state_ref: kv:s-abc:<previous N>,  // absent for first chunk
+                    state_sink: kv:s-abc:<current N> }
     file        = WAV containing this chunk
 
 Each version is create-only. A chunk reads N-1 and writes N; it never
@@ -109,14 +110,17 @@ retry receives a create conflict rather than clobbering newer state. After N
 is confirmed, the gateway best-effort retires N-1. That prevents a long stream
 from retaining one multi-megabyte blob per 160 ms chunk.
 
-At endpointing, kv_mode=final references the latest version and sends an empty,
-valid WAV. The worker finalizes accumulated model state without appending the
-utterance audio a second time.
+At endpointing, the same envelope carries `mode=final` and references the
+latest version; the request has an empty, valid WAV. The worker finalizes
+accumulated model state without appending utterance audio a second time.
 
 ## 5. Bifrost: stateless data, but a sticky primary preference
 
-Bifrost receives standard multipart HTTP. It forwards state_ref, state_sink,
-and kv_mode to the worker because unknown request form fields pass through. It
+Bifrost receives standard multipart HTTP. Version 1.5 drops unknown form
+fields, so the gateway places the tiny, versioned reference envelope in the
+standard OpenAI `prompt` field, which Bifrost preserves. The worker unwraps it
+into `kv_mode`, `state_ref`, and `state_sink`. Bifrost never accesses KVTier or
+sees KV bytes; it only routes the audio request and opaque reference names. It
 normalizes responses, so worker-specific fields such as worker_id do not come
 back through Bifrost.
 

@@ -50,14 +50,13 @@ func TestFirstPushCarriesASinkButNoRef(t *testing.T) {
 	if resp.Text != "hello" || resp.LastSeqApplied != 100 {
 		t.Errorf("resp = %+v", resp)
 	}
-	if got := cap.fields["state_ref"]; len(got) != 0 {
-		t.Errorf("state_ref = %v, want absent — there is no predecessor to read", got)
+	if got := cap.fields["prompt"]; len(got) != 1 || got[0] != kvPrompt("stream", "", "kv:s1:100") {
+		t.Errorf("prompt = %v, want KV envelope for first chunk", got)
 	}
-	if got := cap.fields["state_sink"]; len(got) != 1 || got[0] != "kv:s1:100" {
-		t.Errorf("state_sink = %v, want [kv:s1:100]", got)
-	}
-	if got := cap.fields["kv_mode"]; len(got) != 1 || got[0] != "stream" {
-		t.Errorf("kv_mode = %v, want [stream]", got)
+	for _, field := range []string{"state_ref", "state_sink", "kv_mode"} {
+		if got := cap.fields[field]; len(got) != 0 {
+			t.Errorf("%s = %v, want absent: Bifrost drops custom multipart fields", field, got)
+		}
 	}
 }
 
@@ -76,11 +75,8 @@ func TestSecondPushReadsThePredecessorAndWritesANewVersion(t *testing.T) {
 	if _, err := c.Push(ctx, PushReq{Handle: "kv:s1", SeqEnd: 200, Audio: []byte("b")}); err != nil {
 		t.Fatal(err)
 	}
-	if got := cap.fields["state_ref"]; len(got) != 1 || got[0] != "kv:s1:100" {
-		t.Errorf("state_ref = %v, want [kv:s1:100]", got)
-	}
-	if got := cap.fields["state_sink"]; len(got) != 1 || got[0] != "kv:s1:200" {
-		t.Errorf("state_sink = %v, want [kv:s1:200] — a new version, not the one just read", got)
+	if got := cap.fields["prompt"]; len(got) != 1 || got[0] != kvPrompt("stream", "kv:s1:100", "kv:s1:200") {
+		t.Errorf("prompt = %v, want predecessor and new immutable version", got)
 	}
 }
 
@@ -194,14 +190,8 @@ func TestFlushFinalizesAgainstTheLatestVersionWithoutAppendingAudio(t *testing.T
 	if resp.Text != "the final" || !resp.Final {
 		t.Errorf("resp = %+v", resp)
 	}
-	if got := cap.fields["kv_mode"]; len(got) != 1 || got[0] != "final" {
-		t.Errorf("kv_mode = %v, want [final]", got)
-	}
-	if got := cap.fields["state_ref"]; len(got) != 1 || got[0] != "kv:s1:300" {
-		t.Errorf("state_ref = %v, want [kv:s1:300]", got)
-	}
-	if got := cap.fields["state_sink"]; len(got) != 0 {
-		t.Errorf("state_sink = %v, want absent — a final publishes no successor", got)
+	if got := cap.fields["prompt"]; len(got) != 1 || got[0] != kvPrompt("final", "kv:s1:300", "") {
+		t.Errorf("prompt = %v, want final envelope against latest version", got)
 	}
 }
 
@@ -299,11 +289,8 @@ func TestOpenResetsTheVersionCounterSoANewUtteranceStartsClean(t *testing.T) {
 	if _, err := c.Push(ctx, PushReq{Handle: "kv:s1", SeqEnd: 600, Audio: []byte("b")}); err != nil {
 		t.Fatal(err)
 	}
-	if got := cap.fields["state_ref"]; len(got) != 0 {
-		t.Errorf("state_ref = %v, want absent — it points at a version Close deleted", got)
-	}
-	if got := cap.fields["state_sink"]; len(got) != 1 || got[0] != "kv:s1:600" {
-		t.Errorf("state_sink = %v, want [kv:s1:600]", got)
+	if got := cap.fields["prompt"]; len(got) != 1 || got[0] != kvPrompt("stream", "", "kv:s1:600") {
+		t.Errorf("prompt = %v, want clean first-chunk envelope after Open", got)
 	}
 }
 

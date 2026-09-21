@@ -116,6 +116,7 @@ func fakeWorker(t *testing.T) *httptest.Server {
 			Status:               "READY",
 			CompatibilityKeyHash: "sha256:mock",
 			Capabilities:         Capabilities{Streaming: true, Serializable: true, Modes: []string{"online", "offline"}},
+			KVTier:               &KVTierAdvert{Enabled: true, URL: "http://tier:9500", LocalHits: 8, TierHits: 2, Misses: 1},
 		})
 	})
 
@@ -218,6 +219,9 @@ func TestHTTPClientCloseAndHealth(t *testing.T) {
 	}
 	if adv.CompatibilityKeyHash != "sha256:mock" {
 		t.Fatalf("got CompatibilityKeyHash %q, want sha256:mock", adv.CompatibilityKeyHash)
+	}
+	if adv.KVTier == nil || adv.KVTier.LocalHits != 8 || adv.KVTier.TierHits != 2 || adv.KVTier.Misses != 1 {
+		t.Fatalf("got KVTier %+v, want locality counters", adv.KVTier)
 	}
 }
 

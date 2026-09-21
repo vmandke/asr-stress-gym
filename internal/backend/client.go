@@ -140,8 +140,11 @@ type RestoreResp struct {
 // it reads and publishes session state. See cmd/kvtier and
 // docs/KVCACHE.md.
 type KVTierAdvert struct {
-	Enabled bool   `json:"enabled"`
-	URL     string `json:"url"`
+	Enabled   bool   `json:"enabled"`
+	URL       string `json:"url"`
+	LocalHits int64  `json:"local_hits"`
+	TierHits  int64  `json:"tier_hits"`
+	Misses    int64  `json:"misses"`
 }
 
 // WorkerAdvert matches build-plan.md's "Worker advertisement" JSON,

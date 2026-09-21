@@ -98,6 +98,8 @@
   .ctl button.on { border-color: var(--ok); color: var(--ok); }
   .ctl button:disabled { opacity: .4; cursor: not-allowed; }
   .tabs button.on { border-color: var(--accent); color: var(--accent); }
+  .tabs select { background: #0d1117; border: 1px solid var(--line); color: var(--ink);
+    font: inherit; font-size: 12px; padding: 2px 5px; border-radius: 4px; }
 
   canvas { width: 100%; display: block; }
   .legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; margin-top: 6px; color: var(--dim); }
@@ -186,6 +188,8 @@
       <span class="tabs">
         <button data-tab="traffic" class="on">traffic</button>
         <button data-tab="latency">latency</button>
+        <button data-tab="cache">KV cache</button>
+        <select id="cache-tier" aria-label="KV tier"><option value="all">all tiers</option></select>
         <button data-tab="nodes">resources</button>
       </span>
       <span class="sub" id="chart-note"></span>
@@ -221,7 +225,7 @@
 
 const S = {
   snap: null, nodes: { order: [], series: {}, latest: [] },
-  lat: [], traffic: [], marks: [], prevPushes: null,
+  lat: [], traffic: [], cache: [], marks: [], prevPushes: null, prevCache: null, cacheTier: "all",
   selStream: null, log: [], tab: "traffic", actions: {},
 };
 const WINDOW_MS = 4 * 60 * 1000;
@@ -527,6 +531,7 @@ function marks(g, X, pad, ih, t0) {
 function drawChart() {
   if (S.tab === "traffic") drawTraffic();
   else if (S.tab === "latency") drawLatency();
+  else if (S.tab === "cache") drawCache();
   else drawResources();
 }
 
@@ -599,6 +604,47 @@ function drawLatency() {
   const last = S.lat[S.lat.length - 1];
   $("chart-legend").innerHTML = series.map(([k, c]) =>
     `<span><i style="background:${c}"></i>${k} ${fmtMs(last[k])}</span>`).join("");
+}
+
+// These counters come from each worker's /health response and are sampled
+// by the gateway once a second. Locality is evidence of reuse; low latency
+// alone would not be.
+function drawCache() {
+  const { g, w, h } = prep(170);
+  const pad = { l: 46, r: 8, t: 8, b: 16 }, iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+  $("chart-note").textContent = "KV-state locality per second";
+  $("chart-help").textContent = "Green local hits reuse the prior chunk's deserialized state on the same worker. Blue shared-tier hits restore state written by a peer. Red misses mean a requested predecessor was unavailable. This is within one utterance: VAD finalization clears state, so a later utterance correctly starts fresh.";
+
+  const points = S.cache.flatMap((p) => {
+    const v = p.tiers[S.cacheTier];
+    return v ? [{ t: p.t, ...v }] : [];
+  });
+  if (points.length < 2) {
+    g.fillStyle = "#6e7681";
+    g.fillText("waiting for KV-backed streaming traffic…", pad.l, pad.t + 16);
+    $("chart-legend").innerHTML = ""; return;
+  }
+  const t0 = points[0].t, t1 = points[points.length - 1].t || t0 + 1;
+  let max = 1;
+  for (const p of points) max = Math.max(max, p.local + p.tier + p.miss);
+  max *= 1.15;
+  const X = (t) => pad.l + iw * (t - t0) / Math.max(1, t1 - t0);
+  const Y = (v) => pad.t + ih - ih * (v / max);
+  axes(g, w, h, pad, max, "/s");
+
+  const series = [["local", "#3fb950", "local hit"], ["tier", "#58a6ff", "shared-tier hit"], ["miss", "#f85149", "miss"]];
+  for (const [key, color] of series) {
+    g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
+    points.forEach((p, i) => { const x = X(p.t), y = Y(p[key]); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke();
+  }
+  g.lineWidth = 1;
+  const last = points[points.length - 1];
+  const accesses = last.local + last.tier + last.miss;
+  const hitRate = accesses ? (100 * (last.local + last.tier) / accesses).toFixed(0) + "% hit" : "no reads";
+  $("chart-legend").innerHTML = series.map(([key, color, name]) =>
+    `<span><i style="background:${color}"></i>${name} ${last[key].toFixed(1)}/s</span>`).join("") +
+    `<span>${hitRate} · ${last.workers} KV worker${last.workers === 1 ? "" : "s"}</span>`;
 }
 
 // Memory against each container's cgroup LIMIT, because that is the only
@@ -747,11 +793,71 @@ function renderLog() {
 async function pollNodes() {
   try {
     const r = await fetch("/api/nodes");
-    if (r.ok) { S.nodes = await r.json(); renderFleet(); if (S.tab === "nodes") drawChart(); }
+    if (r.ok) {
+      S.nodes = await r.json();
+      recordCache();
+      renderCachePicker();
+      renderFleet();
+      if (S.tab === "nodes" || S.tab === "cache") drawChart();
+    }
   } catch (e) { /* the SSE feed reports connectivity */ }
 }
 
+function recordCache() {
+  const totals = { all: { local: 0, tier: 0, miss: 0, workers: 0 } };
+  let now = 0;
+  for (const s of S.nodes.latest || []) {
+    now = Math.max(now, s.at_ms || 0);
+    if (!s.kv_enabled) continue;
+    const name = tierName(s.kv_tier) || s.node;
+    const value = {
+      local: s.kv_local_hits || 0,
+      tier: s.kv_tier_hits || 0,
+      miss: s.kv_misses || 0,
+      workers: 1,
+    };
+    const total = totals[name] || { local: 0, tier: 0, miss: 0, workers: 0 };
+    for (const key of Object.keys(value)) {
+      total[key] += value[key];
+      totals.all[key] += value[key];
+    }
+    totals[name] = total;
+  }
+  if (!now || !S.prevCache || now <= S.prevCache.t) {
+    S.prevCache = { t: now, v: totals };
+    return;
+  }
+  const dt = (now - S.prevCache.t) / 1000;
+  if (dt <= 0) return;
+  const tiers = {};
+  for (const [name, total] of Object.entries(totals)) {
+    const before = S.prevCache.v[name] || total;
+    tiers[name] = {
+      workers: total.workers,
+      local: Math.max(0, total.local - before.local) / dt,
+      tier: Math.max(0, total.tier - before.tier) / dt,
+      miss: Math.max(0, total.miss - before.miss) / dt,
+    };
+  }
+  S.cache.push({ t: now, tiers });
+  while (S.cache.length && now - S.cache[0].t > WINDOW_MS) S.cache.shift();
+  S.prevCache = { t: now, v: totals };
+}
+
+function tierName(url) {
+  try { return new URL(url).hostname; } catch { return ""; }
+}
+
+function renderCachePicker() {
+  const select = $("cache-tier"), old = S.cacheTier;
+  const names = [...new Set((S.nodes.latest || []).filter(n => n.kv_enabled).map(n => tierName(n.kv_tier) || n.node))].sort();
+  select.innerHTML = `<option value="all">all tiers</option>` + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  S.cacheTier = names.includes(old) || old === "all" ? old : "all";
+  select.value = S.cacheTier;
+}
+
 connect();
+$("cache-tier").onchange = (e) => { S.cacheTier = e.target.value; if (S.tab === "cache") drawChart(); };
 pollNodes(); pollLoad();
 setInterval(pollNodes, 1000);
 setInterval(pollLog, 700);

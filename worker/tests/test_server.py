@@ -5,6 +5,9 @@ against server.app with the mock adapter — no network, no subprocess.
 from __future__ import annotations
 
 import base64
+import json
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -13,6 +16,17 @@ import server
 client = TestClient(server.app)
 
 AUDIO_HEADERS_CT = {"Content-Type": "application/octet-stream"}
+
+
+def test_kv_prompt_round_trips_the_gateway_reference_envelope():
+    payload = {"m": "stream", "r": "kv:s1:100", "s": "kv:s1:200"}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    assert server._kv_prompt("asr-stress-gym-kv:v1:" + encoded) == ("stream", "kv:s1:100", "kv:s1:200")
+
+
+def test_kv_prompt_rejects_a_malformed_envelope():
+    with pytest.raises(ValueError, match="invalid KV prompt envelope"):
+        server._kv_prompt("asr-stress-gym-kv:v1:not-base64")
 
 
 def _open(session_id: str) -> dict:

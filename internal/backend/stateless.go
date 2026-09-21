@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -60,6 +61,22 @@ type StatelessClient struct {
 	mu          sync.Mutex
 	lastApplied uint64 // the version currently published in the tier
 	lastText    string // answer to replay a push at or below lastApplied
+}
+
+// kvPromptPrefix marks a small, versioned envelope in OpenAI's standard
+// transcription `prompt` field. Bifrost v1.5 normalizes multipart forms and
+// drops provider-specific fields such as state_ref; it preserves prompt.
+// This carries only references, never KV bytes. The selected worker still
+// reads and writes its family KVTier directly.
+const kvPromptPrefix = "asr-stress-gym-kv:v1:"
+
+func kvPrompt(mode, ref, sink string) string {
+	b, _ := json.Marshal(struct {
+		Mode string `json:"m"`
+		Ref  string `json:"r,omitempty"`
+		Sink string `json:"s,omitempty"`
+	}{mode, ref, sink})
+	return kvPromptPrefix + base64.RawURLEncoding.EncodeToString(b)
 }
 
 // NewStatelessClient builds a client over one compatibility-key cohort.
@@ -123,14 +140,14 @@ func (c *StatelessClient) Push(ctx context.Context, r PushReq) (PushResp, error)
 		return PushResp{Text: text, LastSeqApplied: applied, Generation: r.ExpectedGeneration}, nil
 	}
 
+	ref := ""
+	if applied > 0 {
+		ref = stateRef(r.Handle, applied)
+	}
 	fields := map[string]string{
 		"model":           c.primary,
 		"response_format": "json",
-		"kv_mode":         "stream",
-		"state_sink":      stateRef(r.Handle, r.SeqEnd),
-	}
-	if applied > 0 {
-		fields["state_ref"] = stateRef(r.Handle, applied)
+		"prompt":          kvPrompt("stream", ref, stateRef(r.Handle, r.SeqEnd)),
 	}
 
 	out, err := c.call(ctx, fields, r.Audio)
@@ -187,13 +204,14 @@ func (c *StatelessClient) Flush(ctx context.Context, handle string) (FlushResp, 
 	applied := c.lastApplied
 	c.mu.Unlock()
 
+	ref := ""
+	if applied > 0 {
+		ref = stateRef(handle, applied)
+	}
 	fields := map[string]string{
 		"model":           c.primary,
 		"response_format": "json",
-		"kv_mode":         "final",
-	}
-	if applied > 0 {
-		fields["state_ref"] = stateRef(handle, applied)
+		"prompt":          kvPrompt("final", ref, ""),
 	}
 	// An empty payload: finalize consumes the state built by previous
 	// pushes and must not append audio of its own. emptyWAV is a valid
@@ -247,12 +265,10 @@ func (c *StatelessClient) Health(ctx context.Context) (WorkerAdvert, error) {
 // call posts one OpenAI-shaped transcription through Bifrost and returns
 // the text.
 //
-// The fallback chain rides as repeated `fallbacks` form fields, and the
-// KV references as `state_ref`/`state_sink`. Both work because Bifrost
-// forwards unknown multipart fields to the provider verbatim — measured,
-// along with the fact that it STRIPS unknown response fields, which is why
-// nothing comes back this way and a miss is signalled as a status code.
-// See docs/KVCACHE.md.
+// The fallback chain rides as repeated `fallbacks` form fields. KV
+// references ride inside the standard `prompt` field because Bifrost v1.5
+// drops unknown multipart fields. The worker unwraps prompt, then talks to
+// its KVTier directly; Bifrost never sees KV bytes. See docs/KVCACHE.md.
 func (c *StatelessClient) call(ctx context.Context, fields map[string]string, audio []byte) (string, error) {
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)

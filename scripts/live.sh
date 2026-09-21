@@ -82,7 +82,7 @@ if [[ -n "${NO_BUILD:-}" ]]; then
   docker compose up -d
 else
   bold "Building and starting everything"
-  note "rebuilding so no container silently runs pre-kv_mode code"
+  note "rebuilding so no container silently runs pre-KV-envelope code"
   docker compose up -d --build
 fi
 
@@ -141,10 +141,10 @@ sleep 12
 
 # --- 6. prove the stateless path actually engaged ---------------------
 #
-# "STATELESS_STREAM is set" and "sessions are running on the shared tier"
-# are different claims. A kv:-prefixed handle is the observable one: it is
-# the reference prefix backend.StatelessClient names a session's versions
-# under, so it cannot appear unless that client is the one serving.
+# "STATELESS_STREAM is set" and "workers actually used the shared tier"
+# are different claims. A kv:-prefixed handle proves only that the gateway
+# selected StatelessClient; KVTier writes and local hits prove that Bifrost
+# preserved the reference envelope and the worker really applied it.
 bold "Verifying"
 verdict="$(curl --fail --silent "${gw}/api/streams" | python3 -c "
 import json, sys
@@ -162,6 +162,22 @@ else
   note "  every live session shows a plain worker handle, so STATELESS_STREAM"
   note "  did not take effect. Usually a stale image, or bifrost not up:"
   note "  docker compose logs gateway | grep -i 'stateless\\|bifrost'"
+fi
+
+kv_writes="$(curl --fail --silent "${gw}/api/kv" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(sum((p.get("tier_stats") or {}).get("puts", 0) for p in d.get("pools", [])))
+')"
+kv_local_hits="$(curl --fail --silent "${gw}/api/nodes" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(sum(n.get("kv_local_hits", 0) for n in d.get("latest", [])))
+')"
+if [[ "${kv_writes}" -gt 0 && "${kv_local_hits}" -gt 0 ]]; then
+  note "KV proof: ${kv_writes} tier writes, ${kv_local_hits} local cache hits"
+else
+  fail "KV path did not engage (tier writes=${kv_writes}, local hits=${kv_local_hits}). Refusing to call this a stateless KV demo."
 fi
 
 if command -v node >/dev/null 2>&1; then
