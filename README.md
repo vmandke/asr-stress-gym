@@ -7,6 +7,15 @@ cache, routing, replay, failover and observability.
 > **Model cache accelerates recovery when compatible. Audio replay
 > guarantees recovery when it is not.**
 
+## Live dashboard
+
+The operator view shows the two streaming model families, their workers, live
+traffic, and the independent per-family KV-cache hit rates. Each KV-tier line
+is a different color: a sustained local-hit rate shows that the worker is
+reusing state from the previous audio chunk rather than reconstructing it.
+
+![Live dashboard: Zipformer and CTC workers with per-tier KV-cache hit-rate lines](bifrost/images/Screenshot-KV-Cache.png)
+
 ## Try it
 
 ```bash
